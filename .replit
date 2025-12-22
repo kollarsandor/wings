@@ -8,3 +8,26 @@ packages = ["cowsay"]
 
 [agent]
 expertMode = true
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Neural Framework"
+
+[[workflows.workflow]]
+name = "Neural Framework"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "zig run main.zig"
+
+[workflows.workflow.metadata]
+outputType = "console"
