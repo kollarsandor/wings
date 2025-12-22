@@ -1,0 +1,1131 @@
+import std.channel (Channel, Sender, Receiver)
+import std.process (Process)
+import std.string (String, StringBuffer)
+import std.array (Array)
+import std.hash (Hash, Hasher)
+import std.map (Map)
+import std.set (Set)
+import std.option (Option, Some, None)
+import std.result (Result, Ok, Err)
+import std.iter (Iterator)
+import std.io (Write, Read)
+import std.fs (File, Path, Directory)
+import std.time (Duration, Instant)
+import std.sync (Mutex, RwLock)
+import std.cmp (Ordering, Compare)
+import std.fmt (Format, Formatter)
+import std.rand (Random)
+import std.bytes (Bytes)
+
+class DataSample {
+    let @id: Int
+    let @data: Array[Float]
+    let @label: Int
+    let @features: Map[String, Float]
+    let @metadata: Map[String, String]
+    let @weight: Float
+    let @is_valid: Bool
+
+    fn static new(id: Int, data: Array[Float], label: Int) -> DataSample {
+        DataSample {
+            @id = id,
+            @data = data,
+            @label = label,
+            @features = Map.new,
+            @metadata = Map.new,
+            @weight = 1.0,
+            @is_valid = true
+        }
+    }
+
+    fn with_features(mut self, features: Map[String, Float]) -> DataSample {
+        @features = features
+        self
+    }
+
+    fn with_metadata(mut self, metadata: Map[String, String]) -> DataSample {
+        @metadata = metadata
+        self
+    }
+
+    fn with_weight(mut self, weight: Float) -> DataSample {
+        @weight = weight
+        self
+    }
+
+    fn data_size -> Int {
+        @data.size
+    }
+
+    fn clone -> DataSample {
+        DataSample {
+            @id = @id,
+            @data = @data.clone,
+            @label = @label,
+            @features = @features.clone,
+            @metadata = @metadata.clone,
+            @weight = @weight,
+            @is_valid = @is_valid
+        }
+    }
+}
+
+class Batch {
+    let @batch_id: Int
+    let @samples: Array[DataSample]
+    let @batch_size: Int
+    let @data_tensor: Array[Float]
+    let @label_tensor: Array[Int]
+    let @attention_mask: Array[Float]
+    let @is_padded: Bool
+    let @creation_time: Instant
+
+    fn static new(batch_id: Int, samples: Array[DataSample]) -> Batch {
+        let batch_size = samples.size
+        let mut data_tensor = Array.new
+        let mut label_tensor = Array.new
+        let mut attention_mask = Array.new
+
+        let mut i = 0
+        loop {
+            if i >= batch_size {
+                break
+            }
+            let sample = samples.get(i).unwrap
+            
+            let mut j = 0
+            loop {
+                if j >= sample.data.size {
+                    break
+                }
+                data_tensor.push(sample.data.get(j).unwrap)
+                attention_mask.push(1.0)
+                j = j + 1
+            }
+            
+            label_tensor.push(sample.label)
+            i = i + 1
+        }
+
+        Batch {
+            @batch_id = batch_id,
+            @samples = samples,
+            @batch_size = batch_size,
+            @data_tensor = data_tensor,
+            @label_tensor = label_tensor,
+            @attention_mask = attention_mask,
+            @is_padded = false,
+            @creation_time = Instant.now
+        }
+    }
+
+    fn pad_to_length(mut self, target_length: Int, pad_value: Float) {
+        let current_length = @data_tensor.size / @batch_size
+        if current_length >= target_length {
+            return
+        }
+
+        let mut new_data = Array.new
+        let mut new_mask = Array.new
+
+        let mut b = 0
+        loop {
+            if b >= @batch_size {
+                break
+            }
+            
+            let mut i = 0
+            loop {
+                if i >= target_length {
+                    break
+                }
+                if i < current_length {
+                    new_data.push(@data_tensor.get(b * current_length + i).unwrap)
+                    new_mask.push(1.0)
+                } else {
+                    new_data.push(pad_value)
+                    new_mask.push(0.0)
+                }
+                i = i + 1
+            }
+            
+            b = b + 1
+        }
+
+        @data_tensor = new_data
+        @attention_mask = new_mask
+        @is_padded = true
+    }
+}
+
+class DatasetConfig {
+    let @batch_size: Int
+    let @shuffle: Bool
+    let @num_workers: Int
+    let @prefetch_factor: Int
+    let @drop_last: Bool
+    let @pin_memory: Bool
+    let @persistent_workers: Bool
+    let @seed: Int
+    let @max_samples: Int
+    let @validation_split: Float
+    let @augmentation_enabled: Bool
+
+    fn static default -> DatasetConfig {
+        DatasetConfig {
+            @batch_size = 32,
+            @shuffle = true,
+            @num_workers = 4,
+            @prefetch_factor = 2,
+            @drop_last = false,
+            @pin_memory = true,
+            @persistent_workers = true,
+            @seed = 42,
+            @max_samples = -1,
+            @validation_split = 0.1,
+            @augmentation_enabled = true
+        }
+    }
+
+    fn with_batch_size(mut self, size: Int) -> DatasetConfig {
+        @batch_size = size
+        self
+    }
+
+    fn with_num_workers(mut self, workers: Int) -> DatasetConfig {
+        @num_workers = workers
+        self
+    }
+
+    fn with_shuffle(mut self, shuffle: Bool) -> DatasetConfig {
+        @shuffle = shuffle
+        self
+    }
+}
+
+class LoaderMessage {
+    let @message_type: Int
+    let @batch_indices: Array[Int]
+    let @worker_id: Int
+    let @priority: Int
+
+    fn static load_batch(indices: Array[Int], priority: Int) -> LoaderMessage {
+        LoaderMessage {
+            @message_type = 0,
+            @batch_indices = indices,
+            @worker_id = -1,
+            @priority = priority
+        }
+    }
+
+    fn static shutdown -> LoaderMessage {
+        LoaderMessage {
+            @message_type = -1,
+            @batch_indices = Array.new,
+            @worker_id = -1,
+            @priority = 0
+        }
+    }
+
+    fn static prefetch(indices: Array[Int]) -> LoaderMessage {
+        LoaderMessage {
+            @message_type = 1,
+            @batch_indices = indices,
+            @worker_id = -1,
+            @priority = 1
+        }
+    }
+}
+
+class LoaderResult {
+    let @batch: Batch
+    let @worker_id: Int
+    let @load_time_ns: Int
+    let @success: Bool
+    let @error_message: String
+    let @cache_hit: Bool
+
+    fn static success(batch: Batch, worker_id: Int, load_time: Int) -> LoaderResult {
+        LoaderResult {
+            @batch = batch,
+            @worker_id = worker_id,
+            @load_time_ns = load_time,
+            @success = true,
+            @error_message = "",
+            @cache_hit = false
+        }
+    }
+
+    fn static failure(error: String, worker_id: Int) -> LoaderResult {
+        LoaderResult {
+            @batch = Batch.new(0, Array.new),
+            @worker_id = worker_id,
+            @load_time_ns = 0,
+            @success = false,
+            @error_message = error,
+            @cache_hit = false
+        }
+    }
+}
+
+class DataAugmentation {
+    let @random_flip_horizontal: Bool
+    let @random_flip_vertical: Bool
+    let @random_rotation: Bool
+    let @rotation_degrees: Float
+    let @random_crop: Bool
+    let @crop_size: Int
+    let @normalize: Bool
+    let @mean: Array[Float]
+    let @std: Array[Float]
+    let @noise_factor: Float
+    let @mixup_alpha: Float
+    let @cutout_size: Int
+
+    fn static default -> DataAugmentation {
+        DataAugmentation {
+            @random_flip_horizontal = true,
+            @random_flip_vertical = false,
+            @random_rotation = true,
+            @rotation_degrees = 15.0,
+            @random_crop = true,
+            @crop_size = 224,
+            @normalize = true,
+            @mean = [0.485, 0.456, 0.406],
+            @std = [0.229, 0.224, 0.225],
+            @noise_factor = 0.0,
+            @mixup_alpha = 0.0,
+            @cutout_size = 0
+        }
+    }
+
+    fn apply(data: Array[Float], rng: ref Random) -> Array[Float] {
+        let mut result = data.clone
+
+        if @normalize {
+            result = normalize_data(result)
+        }
+
+        if @noise_factor > 0.0 {
+            result = add_noise(result, rng)
+        }
+
+        result
+    }
+
+    fn normalize_data(data: Array[Float]) -> Array[Float] {
+        let mut result = Array.new
+        let num_channels = @mean.size
+        let spatial_size = data.size / num_channels
+
+        let mut c = 0
+        loop {
+            if c >= num_channels {
+                break
+            }
+            let mean_c = @mean.get(c).unwrap
+            let std_c = @std.get(c).unwrap
+
+            let mut i = 0
+            loop {
+                if i >= spatial_size {
+                    break
+                }
+                let idx = c * spatial_size + i
+                let val = data.get(idx).unwrap
+                result.push((val - mean_c) / std_c)
+                i = i + 1
+            }
+            c = c + 1
+        }
+
+        result
+    }
+
+    fn add_noise(data: Array[Float], rng: ref Random) -> Array[Float] {
+        let mut result = Array.new
+
+        let mut i = 0
+        loop {
+            if i >= data.size {
+                break
+            }
+            let val = data.get(i).unwrap
+            let noise = (rng.float - 0.5) * 2.0 * @noise_factor
+            result.push(val + noise)
+            i = i + 1
+        }
+
+        result
+    }
+}
+
+class SampleCache {
+    let @cache: Map[Int, DataSample]
+    let @max_size: Int
+    let @access_order: Array[Int]
+    let @hits: Int
+    let @misses: Int
+
+    fn static new(max_size: Int) -> SampleCache {
+        SampleCache {
+            @cache = Map.new,
+            @max_size = max_size,
+            @access_order = Array.new,
+            @hits = 0,
+            @misses = 0
+        }
+    }
+
+    fn mut get(key: Int) -> Option[DataSample] {
+        match @cache.get(key) {
+            case Some(sample) -> {
+                @hits = @hits + 1
+                update_access(key)
+                Some(sample.clone)
+            }
+            case None -> {
+                @misses = @misses + 1
+                None
+            }
+        }
+    }
+
+    fn mut put(key: Int, sample: DataSample) {
+        if @cache.size >= @max_size {
+            evict_lru
+        }
+        @cache.set(key, sample)
+        @access_order.push(key)
+    }
+
+    fn mut update_access(key: Int) {
+        let mut new_order = Array.new
+        let mut i = 0
+        loop {
+            if i >= @access_order.size {
+                break
+            }
+            let k = @access_order.get(i).unwrap
+            if k != key {
+                new_order.push(k)
+            }
+            i = i + 1
+        }
+        new_order.push(key)
+        @access_order = new_order
+    }
+
+    fn mut evict_lru {
+        if @access_order.size > 0 {
+            let lru_key = @access_order.get(0).unwrap
+            @cache.remove(lru_key)
+            let mut new_order = Array.new
+            let mut i = 1
+            loop {
+                if i >= @access_order.size {
+                    break
+                }
+                new_order.push(@access_order.get(i).unwrap)
+                i = i + 1
+            }
+            @access_order = new_order
+        }
+    }
+
+    fn hit_rate -> Float {
+        let total = @hits + @misses
+        if total == 0 {
+            return 0.0
+        }
+        Float.from_int(@hits) / Float.from_int(total)
+    }
+
+    fn mut clear {
+        @cache = Map.new
+        @access_order = Array.new
+        @hits = 0
+        @misses = 0
+    }
+}
+
+class DataLoaderWorker {
+    let @worker_id: Int
+    let @dataset: Array[DataSample]
+    let @input_channel: Receiver[LoaderMessage]
+    let @output_channel: Sender[LoaderResult]
+    let @augmentation: DataAugmentation
+    let @cache: SampleCache
+    let @rng: Random
+    let @samples_loaded: Int
+    let @total_load_time: Int
+
+    fn static spawn(
+        worker_id: Int,
+        dataset: Array[DataSample],
+        input: Receiver[LoaderMessage],
+        output: Sender[LoaderResult],
+        augmentation: DataAugmentation,
+        cache_size: Int,
+        seed: Int
+    ) -> Process {
+        Process.spawn {
+            let mut worker = DataLoaderWorker {
+                @worker_id = worker_id,
+                @dataset = dataset,
+                @input_channel = input,
+                @output_channel = output,
+                @augmentation = augmentation,
+                @cache = SampleCache.new(cache_size),
+                @rng = Random.new(seed + worker_id),
+                @samples_loaded = 0,
+                @total_load_time = 0
+            }
+            worker.run
+        }
+    }
+
+    fn mut run {
+        loop {
+            match @input_channel.receive {
+                case Some(message) -> {
+                    if message.message_type == -1 {
+                        break
+                    }
+                    let result = process_message(message)
+                    @output_channel.send(result)
+                }
+                case None -> break
+            }
+        }
+    }
+
+    fn mut process_message(message: LoaderMessage) -> LoaderResult {
+        let start_time = Instant.now
+
+        let indices = message.batch_indices
+        let mut samples = Array.new
+
+        let mut i = 0
+        loop {
+            if i >= indices.size {
+                break
+            }
+            let idx = indices.get(i).unwrap
+            
+            let sample = match @cache.get(idx) {
+                case Some(cached) -> cached
+                case None -> {
+                    if idx >= 0 and idx < @dataset.size {
+                        let original = @dataset.get(idx).unwrap
+                        let mut augmented = original.clone
+                        augmented = DataSample {
+                            @id = original.id,
+                            @data = @augmentation.apply(original.data, @rng),
+                            @label = original.label,
+                            @features = original.features,
+                            @metadata = original.metadata,
+                            @weight = original.weight,
+                            @is_valid = original.is_valid
+                        }
+                        @cache.put(idx, augmented.clone)
+                        augmented
+                    } else {
+                        DataSample.new(-1, Array.new, -1)
+                    }
+                }
+            }
+            
+            if sample.is_valid {
+                samples.push(sample)
+            }
+            
+            @samples_loaded = @samples_loaded + 1
+            i = i + 1
+        }
+
+        let batch = Batch.new(message.priority, samples)
+        let elapsed = start_time.elapsed
+        @total_load_time = @total_load_time + elapsed.as_nanos.to_int
+
+        LoaderResult.success(batch, @worker_id, elapsed.as_nanos.to_int)
+    }
+}
+
+class IndexSampler {
+    let @indices: Array[Int]
+    let @shuffle: Bool
+    let @seed: Int
+    let @current_epoch: Int
+    let @rng: Random
+
+    fn static new(size: Int, shuffle: Bool, seed: Int) -> IndexSampler {
+        let mut indices = Array.new
+        let mut i = 0
+        loop {
+            if i >= size {
+                break
+            }
+            indices.push(i)
+            i = i + 1
+        }
+
+        let sampler = IndexSampler {
+            @indices = indices,
+            @shuffle = shuffle,
+            @seed = seed,
+            @current_epoch = 0,
+            @rng = Random.new(seed)
+        }
+
+        sampler
+    }
+
+    fn mut reset_epoch {
+        @current_epoch = @current_epoch + 1
+        if @shuffle {
+            shuffle_indices
+        }
+    }
+
+    fn mut shuffle_indices {
+        let n = @indices.size
+        let mut i = n - 1
+        loop {
+            if i <= 0 {
+                break
+            }
+            let j = @rng.int_max(i + 1)
+            let temp = @indices.get(i).unwrap
+            @indices.set(i, @indices.get(j).unwrap)
+            @indices.set(j, temp)
+            i = i - 1
+        }
+    }
+
+    fn get_batch_indices(batch_idx: Int, batch_size: Int) -> Array[Int] {
+        let start = batch_idx * batch_size
+        let end = min(start + batch_size, @indices.size)
+        
+        let mut result = Array.new
+        let mut i = start
+        loop {
+            if i >= end {
+                break
+            }
+            result.push(@indices.get(i).unwrap)
+            i = i + 1
+        }
+        result
+    }
+
+    fn num_batches(batch_size: Int, drop_last: Bool) -> Int {
+        if drop_last {
+            @indices.size / batch_size
+        } else {
+            (@indices.size + batch_size - 1) / batch_size
+        }
+    }
+}
+
+fn min(a: Int, b: Int) -> Int {
+    if a < b { a } else { b }
+}
+
+class ParallelDataLoader {
+    let @config: DatasetConfig
+    let @dataset: Array[DataSample]
+    let @sampler: IndexSampler
+    let @workers: Array[Process]
+    let @input_channels: Array[Sender[LoaderMessage]]
+    let @output_channel: Receiver[LoaderResult]
+    let @output_sender: Sender[LoaderResult]
+    let @prefetch_queue: Array[Int]
+    let @current_batch_idx: Int
+    let @epoch: Int
+    let @augmentation: DataAugmentation
+    let @stats: LoaderStats
+
+    fn static new(dataset: Array[DataSample], config: DatasetConfig) -> ParallelDataLoader {
+        let (output_sender, output_receiver) = Channel.new
+
+        let mut workers = Array.new
+        let mut input_channels = Array.new
+        let augmentation = DataAugmentation.default
+
+        let mut i = 0
+        loop {
+            if i >= config.num_workers {
+                break
+            }
+
+            let (input_sender, input_receiver) = Channel.new
+            input_channels.push(input_sender)
+
+            let worker = DataLoaderWorker.spawn(
+                i,
+                dataset.clone,
+                input_receiver,
+                output_sender.clone,
+                augmentation,
+                1000,
+                config.seed + i
+            )
+            workers.push(worker)
+
+            i = i + 1
+        }
+
+        let sampler = IndexSampler.new(dataset.size, config.shuffle, config.seed)
+
+        ParallelDataLoader {
+            @config = config,
+            @dataset = dataset,
+            @sampler = sampler,
+            @workers = workers,
+            @input_channels = input_channels,
+            @output_channel = output_receiver,
+            @output_sender = output_sender,
+            @prefetch_queue = Array.new,
+            @current_batch_idx = 0,
+            @epoch = 0,
+            @augmentation = augmentation,
+            @stats = LoaderStats.new
+        }
+    }
+
+    fn mut start_epoch {
+        @epoch = @epoch + 1
+        @current_batch_idx = 0
+        @sampler.reset_epoch
+        prefetch_batches
+    }
+
+    fn mut prefetch_batches {
+        let num_to_prefetch = @config.prefetch_factor * @config.num_workers
+        let num_batches = @sampler.num_batches(@config.batch_size, @config.drop_last)
+
+        let mut i = 0
+        loop {
+            if i >= num_to_prefetch {
+                break
+            }
+            let batch_idx = @current_batch_idx + i
+            if batch_idx >= num_batches {
+                break
+            }
+
+            let indices = @sampler.get_batch_indices(batch_idx, @config.batch_size)
+            let worker_idx = batch_idx % @config.num_workers
+            let message = LoaderMessage.load_batch(indices, batch_idx)
+            
+            @input_channels.get(worker_idx).unwrap.send(message)
+            @prefetch_queue.push(batch_idx)
+            
+            i = i + 1
+        }
+    }
+
+    fn mut next_batch -> Option[Batch] {
+        let num_batches = @sampler.num_batches(@config.batch_size, @config.drop_last)
+        
+        if @current_batch_idx >= num_batches {
+            return None
+        }
+
+        let start_time = Instant.now
+
+        match @output_channel.receive {
+            case Some(result) -> {
+                if result.success {
+                    @current_batch_idx = @current_batch_idx + 1
+                    @stats.record_batch(result.load_time_ns)
+                    
+                    let new_batch_idx = @current_batch_idx + @config.prefetch_factor * @config.num_workers - 1
+                    if new_batch_idx < num_batches {
+                        let indices = @sampler.get_batch_indices(new_batch_idx, @config.batch_size)
+                        let worker_idx = new_batch_idx % @config.num_workers
+                        let message = LoaderMessage.load_batch(indices, new_batch_idx)
+                        @input_channels.get(worker_idx).unwrap.send(message)
+                    }
+                    
+                    Some(result.batch)
+                } else {
+                    @stats.record_error
+                    None
+                }
+            }
+            case None -> None
+        }
+    }
+
+    fn has_next -> Bool {
+        let num_batches = @sampler.num_batches(@config.batch_size, @config.drop_last)
+        @current_batch_idx < num_batches
+    }
+
+    fn num_batches -> Int {
+        @sampler.num_batches(@config.batch_size, @config.drop_last)
+    }
+
+    fn mut shutdown {
+        let mut i = 0
+        loop {
+            if i >= @config.num_workers {
+                break
+            }
+            @input_channels.get(i).unwrap.send(LoaderMessage.shutdown)
+            i = i + 1
+        }
+    }
+
+    fn get_stats -> LoaderStats {
+        @stats.clone
+    }
+}
+
+class LoaderStats {
+    let @batches_loaded: Int
+    let @total_load_time_ns: Int
+    let @errors: Int
+    let @avg_batch_time_ns: Int
+    let @min_batch_time_ns: Int
+    let @max_batch_time_ns: Int
+
+    fn static new -> LoaderStats {
+        LoaderStats {
+            @batches_loaded = 0,
+            @total_load_time_ns = 0,
+            @errors = 0,
+            @avg_batch_time_ns = 0,
+            @min_batch_time_ns = Int.max_value,
+            @max_batch_time_ns = 0
+        }
+    }
+
+    fn mut record_batch(load_time_ns: Int) {
+        @batches_loaded = @batches_loaded + 1
+        @total_load_time_ns = @total_load_time_ns + load_time_ns
+        @avg_batch_time_ns = @total_load_time_ns / @batches_loaded
+        
+        if load_time_ns < @min_batch_time_ns {
+            @min_batch_time_ns = load_time_ns
+        }
+        if load_time_ns > @max_batch_time_ns {
+            @max_batch_time_ns = load_time_ns
+        }
+    }
+
+    fn mut record_error {
+        @errors = @errors + 1
+    }
+
+    fn clone -> LoaderStats {
+        LoaderStats {
+            @batches_loaded = @batches_loaded,
+            @total_load_time_ns = @total_load_time_ns,
+            @errors = @errors,
+            @avg_batch_time_ns = @avg_batch_time_ns,
+            @min_batch_time_ns = @min_batch_time_ns,
+            @max_batch_time_ns = @max_batch_time_ns
+        }
+    }
+
+    fn throughput_samples_per_sec(batch_size: Int) -> Float {
+        if @total_load_time_ns == 0 {
+            return 0.0
+        }
+        let total_samples = @batches_loaded * batch_size
+        let seconds = Float.from_int(@total_load_time_ns) / 1_000_000_000.0
+        Float.from_int(total_samples) / seconds
+    }
+}
+
+class DatasetSplit {
+    let @train_indices: Array[Int]
+    let @val_indices: Array[Int]
+    let @test_indices: Array[Int]
+
+    fn static random_split(size: Int, train_ratio: Float, val_ratio: Float, seed: Int) -> DatasetSplit {
+        let rng = Random.new(seed)
+        
+        let mut indices = Array.new
+        let mut i = 0
+        loop {
+            if i >= size {
+                break
+            }
+            indices.push(i)
+            i = i + 1
+        }
+
+        let n = indices.size
+        let mut j = n - 1
+        loop {
+            if j <= 0 {
+                break
+            }
+            let k = rng.int_max(j + 1)
+            let temp = indices.get(j).unwrap
+            indices.set(j, indices.get(k).unwrap)
+            indices.set(k, temp)
+            j = j - 1
+        }
+
+        let train_size = (Float.from_int(size) * train_ratio).to_int
+        let val_size = (Float.from_int(size) * val_ratio).to_int
+
+        let mut train_indices = Array.new
+        let mut val_indices = Array.new
+        let mut test_indices = Array.new
+
+        i = 0
+        loop {
+            if i >= size {
+                break
+            }
+            let idx = indices.get(i).unwrap
+            if i < train_size {
+                train_indices.push(idx)
+            } else if i < train_size + val_size {
+                val_indices.push(idx)
+            } else {
+                test_indices.push(idx)
+            }
+            i = i + 1
+        }
+
+        DatasetSplit {
+            @train_indices = train_indices,
+            @val_indices = val_indices,
+            @test_indices = test_indices
+        }
+    }
+
+    fn static stratified_split(labels: Array[Int], train_ratio: Float, val_ratio: Float, seed: Int) -> DatasetSplit {
+        let rng = Random.new(seed)
+        let size = labels.size
+
+        let mut class_indices: Map[Int, Array[Int]] = Map.new
+
+        let mut i = 0
+        loop {
+            if i >= size {
+                break
+            }
+            let label = labels.get(i).unwrap
+            match class_indices.get(label) {
+                case Some(arr) -> arr.push(i)
+                case None -> {
+                    let arr = Array.new
+                    arr.push(i)
+                    class_indices.set(label, arr)
+                }
+            }
+            i = i + 1
+        }
+
+        let mut train_indices = Array.new
+        let mut val_indices = Array.new
+        let mut test_indices = Array.new
+
+        let mut iter = class_indices.iter
+        loop {
+            match iter.next {
+                case Some(entry) -> {
+                    let indices = entry.value
+                    let class_size = indices.size
+                    let class_train_size = (Float.from_int(class_size) * train_ratio).to_int
+                    let class_val_size = (Float.from_int(class_size) * val_ratio).to_int
+
+                    let mut j = 0
+                    loop {
+                        if j >= class_size {
+                            break
+                        }
+                        let idx = indices.get(j).unwrap
+                        if j < class_train_size {
+                            train_indices.push(idx)
+                        } else if j < class_train_size + class_val_size {
+                            val_indices.push(idx)
+                        } else {
+                            test_indices.push(idx)
+                        }
+                        j = j + 1
+                    }
+                }
+                case None -> break
+            }
+        }
+
+        DatasetSplit {
+            @train_indices = train_indices,
+            @val_indices = val_indices,
+            @test_indices = test_indices
+        }
+    }
+}
+
+class DistributedSampler {
+    let @dataset_size: Int
+    let @num_replicas: Int
+    let @rank: Int
+    let @shuffle: Bool
+    let @seed: Int
+    let @drop_last: Bool
+    let @epoch: Int
+
+    fn static new(dataset_size: Int, num_replicas: Int, rank: Int, shuffle: Bool, seed: Int) -> DistributedSampler {
+        DistributedSampler {
+            @dataset_size = dataset_size,
+            @num_replicas = num_replicas,
+            @rank = rank,
+            @shuffle = shuffle,
+            @seed = seed,
+            @drop_last = false,
+            @epoch = 0
+        }
+    }
+
+    fn mut set_epoch(epoch: Int) {
+        @epoch = epoch
+    }
+
+    fn get_indices -> Array[Int] {
+        let rng = Random.new(@seed + @epoch)
+
+        let mut indices = Array.new
+        let mut i = 0
+        loop {
+            if i >= @dataset_size {
+                break
+            }
+            indices.push(i)
+            i = i + 1
+        }
+
+        if @shuffle {
+            let n = indices.size
+            let mut j = n - 1
+            loop {
+                if j <= 0 {
+                    break
+                }
+                let k = rng.int_max(j + 1)
+                let temp = indices.get(j).unwrap
+                indices.set(j, indices.get(k).unwrap)
+                indices.set(k, temp)
+                j = j - 1
+            }
+        }
+
+        let samples_per_replica = @dataset_size / @num_replicas
+        let start = @rank * samples_per_replica
+        let end = if @rank == @num_replicas - 1 {
+            @dataset_size
+        } else {
+            start + samples_per_replica
+        }
+
+        let mut result = Array.new
+        i = start
+        loop {
+            if i >= end {
+                break
+            }
+            result.push(indices.get(i).unwrap)
+            i = i + 1
+        }
+
+        result
+    }
+}
+
+class CollateFunction {
+    let @pad_value: Float
+    let @max_length: Int
+    let @dynamic_padding: Bool
+
+    fn static default -> CollateFunction {
+        CollateFunction {
+            @pad_value = 0.0,
+            @max_length = 512,
+            @dynamic_padding = true
+        }
+    }
+
+    fn collate(samples: Array[DataSample]) -> Batch {
+        if @dynamic_padding {
+            let mut max_len = 0
+            let mut i = 0
+            loop {
+                if i >= samples.size {
+                    break
+                }
+                let sample = samples.get(i).unwrap
+                if sample.data.size > max_len {
+                    max_len = sample.data.size
+                }
+                i = i + 1
+            }
+            max_len = min(max_len, @max_length)
+            
+            let mut batch = Batch.new(0, samples)
+            batch.pad_to_length(max_len, @pad_value)
+            batch
+        } else {
+            let mut batch = Batch.new(0, samples)
+            batch.pad_to_length(@max_length, @pad_value)
+            batch
+        }
+    }
+}
+
+class pub Main {
+    fn pub static main {
+        let mut dataset = Array.new
+        let mut i = 0
+        loop {
+            if i >= 10000 {
+                break
+            }
+            let mut data = Array.new
+            let mut j = 0
+            loop {
+                if j >= 784 {
+                    break
+                }
+                data.push(Float.from_int(j) / 784.0)
+                j = j + 1
+            }
+            let sample = DataSample.new(i, data, i % 10)
+            dataset.push(sample)
+            i = i + 1
+        }
+
+        let config = DatasetConfig.default
+            .with_batch_size(32)
+            .with_num_workers(4)
+            .with_shuffle(true)
+
+        let mut loader = ParallelDataLoader.new(dataset, config)
+        loader.start_epoch
+
+        let mut batches_processed = 0
+        loop {
+            if loader.has_next == false {
+                break
+            }
+            match loader.next_batch {
+                case Some(batch) -> {
+                    batches_processed = batches_processed + 1
+                }
+                case None -> break
+            }
+        }
+
+        loader.shutdown
+
+        let stats = loader.get_stats
+    }
+}

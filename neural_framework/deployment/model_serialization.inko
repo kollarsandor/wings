@@ -1,0 +1,1123 @@
+import std.channel (Channel, Sender, Receiver)
+import std.process (Process)
+import std.string (String, StringBuffer)
+import std.array (Array)
+import std.hash (Hash, Hasher)
+import std.map (Map)
+import std.set (Set)
+import std.option (Option, Some, None)
+import std.result (Result, Ok, Err)
+import std.iter (Iterator)
+import std.io (Write, Read, ByteWriter, ByteReader)
+import std.fs (File, Path, Directory)
+import std.time (Duration, Instant)
+import std.sync (Mutex, RwLock)
+import std.bytes (Bytes, ByteBuffer)
+import std.json (Json, JsonValue, JsonObject, JsonArray)
+
+class ModelVersion {
+    let @major: Int
+    let @minor: Int
+    let @patch: Int
+    let @build: String
+
+    fn static new(major: Int, minor: Int, patch: Int) -> ModelVersion {
+        ModelVersion {
+            @major = major,
+            @minor = minor,
+            @patch = patch,
+            @build = ""
+        }
+    }
+
+    fn static parse(version_string: String) -> Option[ModelVersion] {
+        let parts = version_string.split(".")
+        if parts.size < 3 {
+            return None
+        }
+        
+        match (parts.get(0), parts.get(1), parts.get(2)) {
+            case (Some(major_str), Some(minor_str), Some(patch_str)) -> {
+                let major = major_str.to_int.unwrap_or(0)
+                let minor = minor_str.to_int.unwrap_or(0)
+                let patch = patch_str.to_int.unwrap_or(0)
+                Some(ModelVersion.new(major, minor, patch))
+            }
+            case _ -> None
+        }
+    }
+
+    fn to_string -> String {
+        @major.to_string + "." + @minor.to_string + "." + @patch.to_string
+    }
+
+    fn is_compatible(other: ref ModelVersion) -> Bool {
+        @major == other.major and @minor >= other.minor
+    }
+}
+
+class TensorMetadata {
+    let @name: String
+    let @shape: Array[Int]
+    let @dtype: String
+    let @offset: Int
+    let @size: Int
+    let @compression: String
+    let @checksum: Int
+
+    fn static new(name: String, shape: Array[Int], dtype: String, offset: Int, size: Int) -> TensorMetadata {
+        TensorMetadata {
+            @name = name,
+            @shape = shape,
+            @dtype = dtype,
+            @offset = offset,
+            @size = size,
+            @compression = "none",
+            @checksum = 0
+        }
+    }
+
+    fn num_elements -> Int {
+        let mut total = 1
+        let mut i = 0
+        loop {
+            if i >= @shape.size {
+                break
+            }
+            total = total * @shape.get(i).unwrap
+            i = i + 1
+        }
+        total
+    }
+
+    fn element_size -> Int {
+        match @dtype.as_str {
+            case "float32" -> 4
+            case "float16" -> 2
+            case "float64" -> 8
+            case "int32" -> 4
+            case "int64" -> 8
+            case "int16" -> 2
+            case "int8" -> 1
+            case "uint8" -> 1
+            case "bool" -> 1
+            case _ -> 4
+        }
+    }
+
+    fn to_json -> JsonValue {
+        let mut obj = JsonObject.new
+        obj.set("name", JsonValue.string(@name))
+        
+        let mut shape_arr = JsonArray.new
+        let mut i = 0
+        loop {
+            if i >= @shape.size {
+                break
+            }
+            shape_arr.push(JsonValue.number(Float.from_int(@shape.get(i).unwrap)))
+            i = i + 1
+        }
+        obj.set("shape", JsonValue.array(shape_arr))
+        obj.set("dtype", JsonValue.string(@dtype))
+        obj.set("offset", JsonValue.number(Float.from_int(@offset)))
+        obj.set("size", JsonValue.number(Float.from_int(@size)))
+        obj.set("compression", JsonValue.string(@compression))
+        obj.set("checksum", JsonValue.number(Float.from_int(@checksum)))
+        
+        JsonValue.object(obj)
+    }
+}
+
+class LayerMetadata {
+    let @name: String
+    let @layer_type: String
+    let @input_shape: Array[Int]
+    let @output_shape: Array[Int]
+    let @parameters: Map[String, TensorMetadata]
+    let @config: Map[String, String]
+    let @activation: String
+
+    fn static new(name: String, layer_type: String) -> LayerMetadata {
+        LayerMetadata {
+            @name = name,
+            @layer_type = layer_type,
+            @input_shape = Array.new,
+            @output_shape = Array.new,
+            @parameters = Map.new,
+            @config = Map.new,
+            @activation = "none"
+        }
+    }
+
+    fn mut add_parameter(name: String, metadata: TensorMetadata) {
+        @parameters.set(name, metadata)
+    }
+
+    fn mut set_config(key: String, value: String) {
+        @config.set(key, value)
+    }
+
+    fn to_json -> JsonValue {
+        let mut obj = JsonObject.new
+        obj.set("name", JsonValue.string(@name))
+        obj.set("layer_type", JsonValue.string(@layer_type))
+        obj.set("activation", JsonValue.string(@activation))
+        
+        let mut input_arr = JsonArray.new
+        let mut i = 0
+        loop {
+            if i >= @input_shape.size {
+                break
+            }
+            input_arr.push(JsonValue.number(Float.from_int(@input_shape.get(i).unwrap)))
+            i = i + 1
+        }
+        obj.set("input_shape", JsonValue.array(input_arr))
+        
+        let mut output_arr = JsonArray.new
+        i = 0
+        loop {
+            if i >= @output_shape.size {
+                break
+            }
+            output_arr.push(JsonValue.number(Float.from_int(@output_shape.get(i).unwrap)))
+            i = i + 1
+        }
+        obj.set("output_shape", JsonValue.array(output_arr))
+        
+        let mut params_obj = JsonObject.new
+        let mut iter = @parameters.iter
+        loop {
+            match iter.next {
+                case Some(entry) -> {
+                    params_obj.set(entry.key, entry.value.to_json)
+                }
+                case None -> break
+            }
+        }
+        obj.set("parameters", JsonValue.object(params_obj))
+        
+        let mut config_obj = JsonObject.new
+        iter = @config.iter
+        loop {
+            match iter.next {
+                case Some(entry) -> {
+                    config_obj.set(entry.key, JsonValue.string(entry.value))
+                }
+                case None -> break
+            }
+        }
+        obj.set("config", JsonValue.object(config_obj))
+        
+        JsonValue.object(obj)
+    }
+}
+
+class ModelMetadata {
+    let @name: String
+    let @version: ModelVersion
+    let @architecture: String
+    let @framework: String
+    let @framework_version: String
+    let @creation_time: String
+    let @description: String
+    let @author: String
+    let @license: String
+    let @layers: Array[LayerMetadata]
+    let @tensors: Array[TensorMetadata]
+    let @config: Map[String, String]
+    let @training_config: Map[String, String]
+    let @total_parameters: Int
+    let @file_size: Int
+    let @checksum: Int
+
+    fn static new(name: String, version: ModelVersion) -> ModelMetadata {
+        ModelMetadata {
+            @name = name,
+            @version = version,
+            @architecture = "",
+            @framework = "neural_framework",
+            @framework_version = "1.0.0",
+            @creation_time = "",
+            @description = "",
+            @author = "",
+            @license = "MIT",
+            @layers = Array.new,
+            @tensors = Array.new,
+            @config = Map.new,
+            @training_config = Map.new,
+            @total_parameters = 0,
+            @file_size = 0,
+            @checksum = 0
+        }
+    }
+
+    fn mut add_layer(layer: LayerMetadata) {
+        @layers.push(layer)
+    }
+
+    fn mut add_tensor(tensor: TensorMetadata) {
+        @tensors.push(tensor)
+        @total_parameters = @total_parameters + tensor.num_elements
+    }
+
+    fn mut set_config(key: String, value: String) {
+        @config.set(key, value)
+    }
+
+    fn to_json -> JsonValue {
+        let mut obj = JsonObject.new
+        obj.set("name", JsonValue.string(@name))
+        obj.set("version", JsonValue.string(@version.to_string))
+        obj.set("architecture", JsonValue.string(@architecture))
+        obj.set("framework", JsonValue.string(@framework))
+        obj.set("framework_version", JsonValue.string(@framework_version))
+        obj.set("creation_time", JsonValue.string(@creation_time))
+        obj.set("description", JsonValue.string(@description))
+        obj.set("author", JsonValue.string(@author))
+        obj.set("license", JsonValue.string(@license))
+        obj.set("total_parameters", JsonValue.number(Float.from_int(@total_parameters)))
+        obj.set("file_size", JsonValue.number(Float.from_int(@file_size)))
+        obj.set("checksum", JsonValue.number(Float.from_int(@checksum)))
+        
+        let mut layers_arr = JsonArray.new
+        let mut i = 0
+        loop {
+            if i >= @layers.size {
+                break
+            }
+            layers_arr.push(@layers.get(i).unwrap.to_json)
+            i = i + 1
+        }
+        obj.set("layers", JsonValue.array(layers_arr))
+        
+        let mut tensors_arr = JsonArray.new
+        i = 0
+        loop {
+            if i >= @tensors.size {
+                break
+            }
+            tensors_arr.push(@tensors.get(i).unwrap.to_json)
+            i = i + 1
+        }
+        obj.set("tensors", JsonValue.array(tensors_arr))
+        
+        let mut config_obj = JsonObject.new
+        let mut iter = @config.iter
+        loop {
+            match iter.next {
+                case Some(entry) -> {
+                    config_obj.set(entry.key, JsonValue.string(entry.value))
+                }
+                case None -> break
+            }
+        }
+        obj.set("config", JsonValue.object(config_obj))
+        
+        let mut training_obj = JsonObject.new
+        iter = @training_config.iter
+        loop {
+            match iter.next {
+                case Some(entry) -> {
+                    training_obj.set(entry.key, JsonValue.string(entry.value))
+                }
+                case None -> break
+            }
+        }
+        obj.set("training_config", JsonValue.object(training_obj))
+        
+        JsonValue.object(obj)
+    }
+}
+
+class TensorData {
+    let @metadata: TensorMetadata
+    let @data: Array[Float]
+
+    fn static new(metadata: TensorMetadata, data: Array[Float]) -> TensorData {
+        TensorData {
+            @metadata = metadata,
+            @data = data
+        }
+    }
+
+    fn size_bytes -> Int {
+        @data.size * @metadata.element_size
+    }
+}
+
+class SerializationFormat {
+    let @format_type: Int
+    let @version: Int
+    let @compression: Bool
+    let @encryption: Bool
+    let @alignment: Int
+
+    fn static binary -> SerializationFormat {
+        SerializationFormat {
+            @format_type = 0,
+            @version = 1,
+            @compression = false,
+            @encryption = false,
+            @alignment = 64
+        }
+    }
+
+    fn static safetensors -> SerializationFormat {
+        SerializationFormat {
+            @format_type = 1,
+            @version = 1,
+            @compression = false,
+            @encryption = false,
+            @alignment = 64
+        }
+    }
+
+    fn static onnx -> SerializationFormat {
+        SerializationFormat {
+            @format_type = 2,
+            @version = 1,
+            @compression = true,
+            @encryption = false,
+            @alignment = 4
+        }
+    }
+
+    fn with_compression(mut self, enabled: Bool) -> SerializationFormat {
+        @compression = enabled
+        self
+    }
+
+    fn with_encryption(mut self, enabled: Bool) -> SerializationFormat {
+        @encryption = enabled
+        self
+    }
+}
+
+class BinaryWriter {
+    let @buffer: ByteBuffer
+    let @position: Int
+    let @alignment: Int
+
+    fn static new(alignment: Int) -> BinaryWriter {
+        BinaryWriter {
+            @buffer = ByteBuffer.new,
+            @position = 0,
+            @alignment = alignment
+        }
+    }
+
+    fn mut write_u8(value: Int) {
+        @buffer.write_u8(value)
+        @position = @position + 1
+    }
+
+    fn mut write_u16(value: Int) {
+        @buffer.write_u16_le(value)
+        @position = @position + 2
+    }
+
+    fn mut write_u32(value: Int) {
+        @buffer.write_u32_le(value)
+        @position = @position + 4
+    }
+
+    fn mut write_u64(value: Int) {
+        @buffer.write_u64_le(value)
+        @position = @position + 8
+    }
+
+    fn mut write_f32(value: Float) {
+        @buffer.write_f32_le(value)
+        @position = @position + 4
+    }
+
+    fn mut write_f64(value: Float) {
+        @buffer.write_f64_le(value)
+        @position = @position + 8
+    }
+
+    fn mut write_string(value: String) {
+        let bytes = value.to_bytes
+        write_u32(bytes.size)
+        let mut i = 0
+        loop {
+            if i >= bytes.size {
+                break
+            }
+            write_u8(bytes.get(i).unwrap)
+            i = i + 1
+        }
+    }
+
+    fn mut write_bytes(bytes: ref Bytes) {
+        let mut i = 0
+        loop {
+            if i >= bytes.size {
+                break
+            }
+            write_u8(bytes.get(i).unwrap)
+            i = i + 1
+        }
+    }
+
+    fn mut align(alignment: Int) {
+        let padding = (alignment - (@position % alignment)) % alignment
+        let mut i = 0
+        loop {
+            if i >= padding {
+                break
+            }
+            write_u8(0)
+            i = i + 1
+        }
+    }
+
+    fn to_bytes -> Bytes {
+        @buffer.to_bytes
+    }
+}
+
+class BinaryReader {
+    let @buffer: Bytes
+    let @position: Int
+    let @size: Int
+
+    fn static new(buffer: Bytes) -> BinaryReader {
+        BinaryReader {
+            @buffer = buffer,
+            @position = 0,
+            @size = buffer.size
+        }
+    }
+
+    fn mut read_u8 -> Option[Int] {
+        if @position >= @size {
+            return None
+        }
+        let value = @buffer.get(@position).unwrap
+        @position = @position + 1
+        Some(value)
+    }
+
+    fn mut read_u16 -> Option[Int] {
+        if @position + 2 > @size {
+            return None
+        }
+        let b0 = @buffer.get(@position).unwrap
+        let b1 = @buffer.get(@position + 1).unwrap
+        @position = @position + 2
+        Some(b0 + (b1 * 256))
+    }
+
+    fn mut read_u32 -> Option[Int] {
+        if @position + 4 > @size {
+            return None
+        }
+        let b0 = @buffer.get(@position).unwrap
+        let b1 = @buffer.get(@position + 1).unwrap
+        let b2 = @buffer.get(@position + 2).unwrap
+        let b3 = @buffer.get(@position + 3).unwrap
+        @position = @position + 4
+        Some(b0 + (b1 * 256) + (b2 * 65536) + (b3 * 16777216))
+    }
+
+    fn mut read_u64 -> Option[Int] {
+        let low = read_u32.unwrap_or(0)
+        let high = read_u32.unwrap_or(0)
+        Some(low + (high * 4294967296))
+    }
+
+    fn mut read_f32 -> Option[Float] {
+        match read_u32 {
+            case Some(bits) -> Some(Float.from_bits(bits))
+            case None -> None
+        }
+    }
+
+    fn mut read_string -> Option[String] {
+        match read_u32 {
+            case Some(length) -> {
+                let mut bytes = Bytes.new
+                let mut i = 0
+                loop {
+                    if i >= length {
+                        break
+                    }
+                    match read_u8 {
+                        case Some(b) -> bytes.push(b)
+                        case None -> return None
+                    }
+                    i = i + 1
+                }
+                Some(String.from_bytes(bytes))
+            }
+            case None -> None
+        }
+    }
+
+    fn mut skip(count: Int) {
+        @position = @position + count
+    }
+
+    fn mut align(alignment: Int) {
+        let padding = (alignment - (@position % alignment)) % alignment
+        @position = @position + padding
+    }
+}
+
+class ModelSerializer {
+    let @format: SerializationFormat
+    let @metadata: ModelMetadata
+    let @tensors: Array[TensorData]
+
+    fn static new(format: SerializationFormat) -> ModelSerializer {
+        ModelSerializer {
+            @format = format,
+            @metadata = ModelMetadata.new("unnamed", ModelVersion.new(1, 0, 0)),
+            @tensors = Array.new
+        }
+    }
+
+    fn mut set_metadata(metadata: ModelMetadata) {
+        @metadata = metadata
+    }
+
+    fn mut add_tensor(tensor: TensorData) {
+        @tensors.push(tensor)
+    }
+
+    fn serialize -> Bytes {
+        let mut writer = BinaryWriter.new(@format.alignment)
+
+        write_header(writer)
+        write_metadata(writer)
+        write_tensor_descriptors(writer)
+        write_tensor_data(writer)
+
+        writer.to_bytes
+    }
+
+    fn write_header(writer: ref BinaryWriter) {
+        writer.write_u8(0x4E)
+        writer.write_u8(0x46)
+        writer.write_u8(0x4D)
+        writer.write_u8(0x4C)
+        
+        writer.write_u32(@format.version)
+        writer.write_u32(@format.format_type)
+        
+        let mut flags = 0
+        if @format.compression {
+            flags = flags + 1
+        }
+        if @format.encryption {
+            flags = flags + 2
+        }
+        writer.write_u32(flags)
+        
+        writer.write_u32(@tensors.size)
+        writer.align(@format.alignment)
+    }
+
+    fn write_metadata(writer: ref BinaryWriter) {
+        let json = @metadata.to_json
+        let json_str = json.to_string
+        writer.write_string(json_str)
+        writer.align(@format.alignment)
+    }
+
+    fn write_tensor_descriptors(writer: ref BinaryWriter) {
+        let mut offset = 0
+        
+        let mut i = 0
+        loop {
+            if i >= @tensors.size {
+                break
+            }
+            let tensor = @tensors.get(i).unwrap
+            let meta = tensor.metadata
+
+            writer.write_string(meta.name)
+            writer.write_u32(meta.shape.size)
+            
+            let mut j = 0
+            loop {
+                if j >= meta.shape.size {
+                    break
+                }
+                writer.write_u32(meta.shape.get(j).unwrap)
+                j = j + 1
+            }
+            
+            writer.write_string(meta.dtype)
+            writer.write_u64(offset)
+            writer.write_u64(tensor.size_bytes)
+            
+            offset = offset + tensor.size_bytes
+            i = i + 1
+        }
+        
+        writer.align(@format.alignment)
+    }
+
+    fn write_tensor_data(writer: ref BinaryWriter) {
+        let mut i = 0
+        loop {
+            if i >= @tensors.size {
+                break
+            }
+            let tensor = @tensors.get(i).unwrap
+
+            let mut j = 0
+            loop {
+                if j >= tensor.data.size {
+                    break
+                }
+                writer.write_f32(tensor.data.get(j).unwrap)
+                j = j + 1
+            }
+
+            writer.align(@format.alignment)
+            i = i + 1
+        }
+    }
+
+    fn save_to_file(path: Path) -> Result[Unit, String] {
+        let data = serialize
+        
+        match File.create(path) {
+            case Ok(file) -> {
+                match file.write(data) {
+                    case Ok(_) -> Ok(())
+                    case Err(e) -> Err("Failed to write file: " + e.to_string)
+                }
+            }
+            case Err(e) -> Err("Failed to create file: " + e.to_string)
+        }
+    }
+}
+
+class ModelDeserializer {
+    let @format: SerializationFormat
+
+    fn static new -> ModelDeserializer {
+        ModelDeserializer {
+            @format = SerializationFormat.binary
+        }
+    }
+
+    fn deserialize(data: Bytes) -> Result[DeserializedModel, String] {
+        let mut reader = BinaryReader.new(data)
+
+        match read_header(reader) {
+            case Ok(header) -> {
+                @format = header.format
+                
+                match read_metadata(reader) {
+                    case Ok(metadata) -> {
+                        match read_tensors(reader, header.tensor_count) {
+                            case Ok(tensors) -> {
+                                Ok(DeserializedModel {
+                                    @metadata = metadata,
+                                    @tensors = tensors
+                                })
+                            }
+                            case Err(e) -> Err(e)
+                        }
+                    }
+                    case Err(e) -> Err(e)
+                }
+            }
+            case Err(e) -> Err(e)
+        }
+    }
+
+    fn read_header(reader: ref BinaryReader) -> Result[FileHeader, String] {
+        let magic0 = reader.read_u8.unwrap_or(0)
+        let magic1 = reader.read_u8.unwrap_or(0)
+        let magic2 = reader.read_u8.unwrap_or(0)
+        let magic3 = reader.read_u8.unwrap_or(0)
+
+        if magic0 != 0x4E or magic1 != 0x46 or magic2 != 0x4D or magic3 != 0x4C {
+            return Err("Invalid file magic number")
+        }
+
+        let version = reader.read_u32.unwrap_or(0)
+        let format_type = reader.read_u32.unwrap_or(0)
+        let flags = reader.read_u32.unwrap_or(0)
+        let tensor_count = reader.read_u32.unwrap_or(0)
+
+        let format = SerializationFormat {
+            @format_type = format_type,
+            @version = version,
+            @compression = (flags & 1) != 0,
+            @encryption = (flags & 2) != 0,
+            @alignment = 64
+        }
+
+        reader.align(format.alignment)
+
+        Ok(FileHeader {
+            @format = format,
+            @tensor_count = tensor_count
+        })
+    }
+
+    fn read_metadata(reader: ref BinaryReader) -> Result[ModelMetadata, String] {
+        match reader.read_string {
+            case Some(json_str) -> {
+                reader.align(@format.alignment)
+                Ok(ModelMetadata.new("loaded_model", ModelVersion.new(1, 0, 0)))
+            }
+            case None -> Err("Failed to read metadata")
+        }
+    }
+
+    fn read_tensors(reader: ref BinaryReader, count: Int) -> Result[Array[TensorData], String] {
+        let mut descriptors = Array.new
+        
+        let mut i = 0
+        loop {
+            if i >= count {
+                break
+            }
+
+            let name = reader.read_string.unwrap_or("")
+            let ndim = reader.read_u32.unwrap_or(0)
+            
+            let mut shape = Array.new
+            let mut j = 0
+            loop {
+                if j >= ndim {
+                    break
+                }
+                shape.push(reader.read_u32.unwrap_or(0))
+                j = j + 1
+            }
+
+            let dtype = reader.read_string.unwrap_or("float32")
+            let offset = reader.read_u64.unwrap_or(0)
+            let size = reader.read_u64.unwrap_or(0)
+
+            let meta = TensorMetadata.new(name, shape, dtype, offset, size)
+            descriptors.push(meta)
+            
+            i = i + 1
+        }
+
+        reader.align(@format.alignment)
+
+        let mut tensors = Array.new
+        i = 0
+        loop {
+            if i >= count {
+                break
+            }
+            let meta = descriptors.get(i).unwrap
+            let num_elements = meta.num_elements
+
+            let mut data = Array.new
+            let mut j = 0
+            loop {
+                if j >= num_elements {
+                    break
+                }
+                data.push(reader.read_f32.unwrap_or(0.0))
+                j = j + 1
+            }
+
+            reader.align(@format.alignment)
+
+            tensors.push(TensorData.new(meta, data))
+            i = i + 1
+        }
+
+        Ok(tensors)
+    }
+
+    fn load_from_file(path: Path) -> Result[DeserializedModel, String] {
+        match File.open(path) {
+            case Ok(file) -> {
+                match file.read_all {
+                    case Ok(data) -> deserialize(data)
+                    case Err(e) -> Err("Failed to read file: " + e.to_string)
+                }
+            }
+            case Err(e) -> Err("Failed to open file: " + e.to_string)
+        }
+    }
+}
+
+class FileHeader {
+    let @format: SerializationFormat
+    let @tensor_count: Int
+}
+
+class DeserializedModel {
+    let @metadata: ModelMetadata
+    let @tensors: Array[TensorData]
+
+    fn get_tensor(name: String) -> Option[TensorData] {
+        let mut i = 0
+        loop {
+            if i >= @tensors.size {
+                break
+            }
+            let tensor = @tensors.get(i).unwrap
+            if tensor.metadata.name == name {
+                return Some(tensor.clone)
+            }
+            i = i + 1
+        }
+        None
+    }
+
+    fn tensor_names -> Array[String] {
+        let mut names = Array.new
+        let mut i = 0
+        loop {
+            if i >= @tensors.size {
+                break
+            }
+            names.push(@tensors.get(i).unwrap.metadata.name)
+            i = i + 1
+        }
+        names
+    }
+}
+
+class CheckpointManager {
+    let @checkpoint_dir: Path
+    let @max_checkpoints: Int
+    let @checkpoints: Array[CheckpointInfo]
+    let @format: SerializationFormat
+
+    fn static new(checkpoint_dir: Path, max_checkpoints: Int) -> CheckpointManager {
+        CheckpointManager {
+            @checkpoint_dir = checkpoint_dir,
+            @max_checkpoints = max_checkpoints,
+            @checkpoints = Array.new,
+            @format = SerializationFormat.binary
+        }
+    }
+
+    fn mut save_checkpoint(
+        model_metadata: ModelMetadata,
+        tensors: Array[TensorData],
+        step: Int,
+        metrics: Map[String, Float]
+    ) -> Result[Path, String] {
+        let filename = "checkpoint_step_" + step.to_string + ".nfml"
+        let path = @checkpoint_dir.join(filename)
+
+        let mut serializer = ModelSerializer.new(@format)
+        serializer.set_metadata(model_metadata)
+
+        let mut i = 0
+        loop {
+            if i >= tensors.size {
+                break
+            }
+            serializer.add_tensor(tensors.get(i).unwrap)
+            i = i + 1
+        }
+
+        match serializer.save_to_file(path.clone) {
+            case Ok(_) -> {
+                let info = CheckpointInfo {
+                    @path = path.clone,
+                    @step = step,
+                    @metrics = metrics,
+                    @timestamp = Instant.now
+                }
+                @checkpoints.push(info)
+                
+                cleanup_old_checkpoints
+                
+                Ok(path)
+            }
+            case Err(e) -> Err(e)
+        }
+    }
+
+    fn mut cleanup_old_checkpoints {
+        while @checkpoints.size > @max_checkpoints {
+            let oldest = @checkpoints.get(0).unwrap
+            let _ = File.remove(oldest.path)
+            
+            let mut new_checkpoints = Array.new
+            let mut i = 1
+            loop {
+                if i >= @checkpoints.size {
+                    break
+                }
+                new_checkpoints.push(@checkpoints.get(i).unwrap)
+                i = i + 1
+            }
+            @checkpoints = new_checkpoints
+        }
+    }
+
+    fn load_latest -> Result[DeserializedModel, String] {
+        if @checkpoints.size == 0 {
+            return Err("No checkpoints available")
+        }
+
+        let latest = @checkpoints.get(@checkpoints.size - 1).unwrap
+        let deserializer = ModelDeserializer.new
+        deserializer.load_from_file(latest.path)
+    }
+
+    fn load_checkpoint(step: Int) -> Result[DeserializedModel, String] {
+        let mut i = 0
+        loop {
+            if i >= @checkpoints.size {
+                break
+            }
+            let checkpoint = @checkpoints.get(i).unwrap
+            if checkpoint.step == step {
+                let deserializer = ModelDeserializer.new
+                return deserializer.load_from_file(checkpoint.path)
+            }
+            i = i + 1
+        }
+        Err("Checkpoint not found for step: " + step.to_string)
+    }
+
+    fn list_checkpoints -> Array[CheckpointInfo] {
+        @checkpoints.clone
+    }
+}
+
+class CheckpointInfo {
+    let @path: Path
+    let @step: Int
+    let @metrics: Map[String, Float]
+    let @timestamp: Instant
+
+    fn clone -> CheckpointInfo {
+        CheckpointInfo {
+            @path = @path.clone,
+            @step = @step,
+            @metrics = @metrics.clone,
+            @timestamp = @timestamp
+        }
+    }
+}
+
+class ModelExporter {
+    fn static export_to_onnx(model: DeserializedModel, output_path: Path) -> Result[Unit, String] {
+        Err("ONNX export not implemented")
+    }
+
+    fn static export_to_safetensors(model: DeserializedModel, output_path: Path) -> Result[Unit, String] {
+        let format = SerializationFormat.safetensors
+        let mut serializer = ModelSerializer.new(format)
+        serializer.set_metadata(model.metadata)
+
+        let mut i = 0
+        loop {
+            if i >= model.tensors.size {
+                break
+            }
+            serializer.add_tensor(model.tensors.get(i).unwrap)
+            i = i + 1
+        }
+
+        serializer.save_to_file(output_path)
+    }
+
+    fn static export_to_tflite(model: DeserializedModel, output_path: Path) -> Result[Unit, String] {
+        Err("TFLite export not implemented")
+    }
+}
+
+class ModelValidator {
+    fn static validate(model: DeserializedModel) -> Result[ValidationReport, String] {
+        let mut issues = Array.new
+        let mut warnings = Array.new
+
+        if model.metadata.name.size == 0 {
+            warnings.push("Model name is empty")
+        }
+
+        if model.tensors.size == 0 {
+            issues.push("Model has no tensors")
+        }
+
+        let mut i = 0
+        loop {
+            if i >= model.tensors.size {
+                break
+            }
+            let tensor = model.tensors.get(i).unwrap
+            
+            if tensor.metadata.name.size == 0 {
+                issues.push("Tensor at index " + i.to_string + " has no name")
+            }
+            
+            if tensor.data.size != tensor.metadata.num_elements {
+                issues.push("Tensor " + tensor.metadata.name + " size mismatch")
+            }
+            
+            i = i + 1
+        }
+
+        let is_valid = issues.size == 0
+
+        Ok(ValidationReport {
+            @is_valid = is_valid,
+            @issues = issues,
+            @warnings = warnings
+        })
+    }
+}
+
+class ValidationReport {
+    let @is_valid: Bool
+    let @issues: Array[String]
+    let @warnings: Array[String]
+
+    fn summary -> String {
+        let mut sb = StringBuffer.new
+        sb.push_string("Validation Report\n")
+        sb.push_string("Valid: " + @is_valid.to_string + "\n")
+        sb.push_string("Issues: " + @issues.size.to_string + "\n")
+        sb.push_string("Warnings: " + @warnings.size.to_string + "\n")
+        sb.to_string
+    }
+}
+
+class pub Main {
+    fn pub static main {
+        let format = SerializationFormat.binary
+        let mut serializer = ModelSerializer.new(format)
+
+        let mut metadata = ModelMetadata.new("test_model", ModelVersion.new(1, 0, 0))
+        metadata.architecture = "transformer"
+        metadata.description = "Test transformer model"
+        serializer.set_metadata(metadata)
+
+        let mut shape = Array.new
+        shape.push(768)
+        shape.push(768)
+
+        let mut data = Array.new
+        let mut i = 0
+        loop {
+            if i >= 768 * 768 {
+                break
+            }
+            data.push(Float.from_int(i) / 1000000.0)
+            i = i + 1
+        }
+
+        let tensor_meta = TensorMetadata.new("layer.weight", shape, "float32", 0, data.size * 4)
+        let tensor = TensorData.new(tensor_meta, data)
+        serializer.add_tensor(tensor)
+
+        let bytes = serializer.serialize
+    }
+}

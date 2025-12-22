@@ -1,0 +1,565 @@
+element Vertex
+    position : tensor[3](float)
+    velocity : tensor[3](float)
+    acceleration : tensor[3](float)
+    mass : float
+    fixed : bool
+end
+
+element Edge
+    rest_length : float
+    stiffness : float
+    damping : float
+end
+
+element Triangle
+    area : float
+    normal : tensor[3](float)
+end
+
+element Tetrahedron
+    volume : float
+    rest_volume : float
+end
+
+extern vertices : set{Vertex}
+extern edges : set{Edge}(vertices, vertices)
+extern triangles : set{Triangle}(vertices, vertices, vertices)
+extern tetrahedra : set{Tetrahedron}(vertices, vertices, vertices, vertices)
+
+func dot(a : tensor[3](float), b : tensor[3](float)) -> float
+    return a(0) * b(0) + a(1) * b(1) + a(2) * b(2)
+end
+
+func cross(a : tensor[3](float), b : tensor[3](float)) -> tensor[3](float)
+    var result : tensor[3](float)
+    result(0) = a(1) * b(2) - a(2) * b(1)
+    result(1) = a(2) * b(0) - a(0) * b(2)
+    result(2) = a(0) * b(1) - a(1) * b(0)
+    return result
+end
+
+func norm(v : tensor[3](float)) -> float
+    return sqrt(dot(v, v))
+end
+
+func normalize(v : tensor[3](float)) -> tensor[3](float)
+    var n : float = norm(v)
+    if n > 1e-10
+        return v / n
+    end
+    return v
+end
+
+func compute_edge_force(e : Edge, v0 : Vertex, v1 : Vertex) -> tensor[3](float)
+    var diff : tensor[3](float) = v1.position - v0.position
+    var length : float = norm(diff)
+    var direction : tensor[3](float) = diff / length
+    
+    var stretch : float = length - e.rest_length
+    var spring_force : float = e.stiffness * stretch
+    
+    var vel_diff : tensor[3](float) = v1.velocity - v0.velocity
+    var damping_force : float = e.damping * dot(vel_diff, direction)
+    
+    var total_force : float = spring_force + damping_force
+    
+    return direction * total_force
+end
+
+proc apply_spring_forces(vertices, edges)
+    for (v0, v1) in edges
+        var e : Edge = edges(v0, v1)
+        var force : tensor[3](float) = compute_edge_force(e, v0, v1)
+        
+        if not v0.fixed
+            v0.acceleration += force / v0.mass
+        end
+        if not v1.fixed
+            v1.acceleration += -force / v1.mass
+        end
+    end
+end
+
+proc apply_gravity(vertices)
+    var gravity : tensor[3](float)
+    gravity(0) = 0.0
+    gravity(1) = -9.81
+    gravity(2) = 0.0
+    
+    for v in vertices
+        if not v.fixed
+            v.acceleration += gravity
+        end
+    end
+end
+
+proc integrate_velocities(vertices, dt : float)
+    for v in vertices
+        if not v.fixed
+            v.velocity += v.acceleration * dt
+        end
+    end
+end
+
+proc integrate_positions(vertices, dt : float)
+    for v in vertices
+        if not v.fixed
+            v.position += v.velocity * dt
+        end
+    end
+end
+
+proc reset_accelerations(vertices)
+    for v in vertices
+        v.acceleration(0) = 0.0
+        v.acceleration(1) = 0.0
+        v.acceleration(2) = 0.0
+    end
+end
+
+proc simulation_step(vertices, edges, dt : float)
+    reset_accelerations(vertices)
+    apply_gravity(vertices)
+    apply_spring_forces(vertices, edges)
+    integrate_velocities(vertices, dt)
+    integrate_positions(vertices, dt)
+end
+
+func compute_triangle_area(t : Triangle, v0 : Vertex, v1 : Vertex, v2 : Vertex) -> float
+    var e1 : tensor[3](float) = v1.position - v0.position
+    var e2 : tensor[3](float) = v2.position - v0.position
+    var cross_product : tensor[3](float) = cross(e1, e2)
+    return 0.5 * norm(cross_product)
+end
+
+func compute_triangle_normal(t : Triangle, v0 : Vertex, v1 : Vertex, v2 : Vertex) -> tensor[3](float)
+    var e1 : tensor[3](float) = v1.position - v0.position
+    var e2 : tensor[3](float) = v2.position - v0.position
+    var cross_product : tensor[3](float) = cross(e1, e2)
+    return normalize(cross_product)
+end
+
+proc update_triangle_properties(vertices, triangles)
+    for (v0, v1, v2) in triangles
+        var t : Triangle = triangles(v0, v1, v2)
+        t.area = compute_triangle_area(t, v0, v1, v2)
+        t.normal = compute_triangle_normal(t, v0, v1, v2)
+    end
+end
+
+func compute_tetrahedron_volume(tet : Tetrahedron, v0 : Vertex, v1 : Vertex, v2 : Vertex, v3 : Vertex) -> float
+    var e1 : tensor[3](float) = v1.position - v0.position
+    var e2 : tensor[3](float) = v2.position - v0.position
+    var e3 : tensor[3](float) = v3.position - v0.position
+    var cross_e2_e3 : tensor[3](float) = cross(e2, e3)
+    return abs(dot(e1, cross_e2_e3)) / 6.0
+end
+
+proc update_tetrahedron_volumes(vertices, tetrahedra)
+    for (v0, v1, v2, v3) in tetrahedra
+        var tet : Tetrahedron = tetrahedra(v0, v1, v2, v3)
+        tet.volume = compute_tetrahedron_volume(tet, v0, v1, v2, v3)
+    end
+end
+
+func compute_volume_strain(tet : Tetrahedron) -> float
+    return (tet.volume - tet.rest_volume) / tet.rest_volume
+end
+
+element NeuralVertex
+    features : tensor[768](float)
+    hidden : tensor[256](float)
+    output : tensor[10](float)
+    gradient : tensor[768](float)
+end
+
+element NeuralEdge
+    weight : float
+    attention : float
+end
+
+extern neural_vertices : set{NeuralVertex}
+extern neural_edges : set{NeuralEdge}(neural_vertices, neural_vertices)
+
+func relu(x : float) -> float
+    if x > 0.0
+        return x
+    end
+    return 0.0
+end
+
+func sigmoid(x : float) -> float
+    return 1.0 / (1.0 + exp(-x))
+end
+
+func tanh_activation(x : float) -> float
+    var exp_pos : float = exp(x)
+    var exp_neg : float = exp(-x)
+    return (exp_pos - exp_neg) / (exp_pos + exp_neg)
+end
+
+func gelu(x : float) -> float
+    var c : float = 0.797884560803
+    var x3 : float = x * x * x
+    var inner : float = c * (x + 0.044715 * x3)
+    return 0.5 * x * (1.0 + tanh_activation(inner))
+end
+
+proc graph_attention_layer(neural_vertices, neural_edges)
+    for v in neural_vertices
+        var attention_sum : tensor[256](float)
+        var attention_weight_sum : float = 0.0
+        
+        for (src, dst) in neural_edges
+            if dst == v
+                var e : NeuralEdge = neural_edges(src, dst)
+                var src_vertex : NeuralVertex = src
+                
+                for i in 256
+                    attention_sum(i) += e.attention * src_vertex.hidden(i)
+                end
+                attention_weight_sum += e.attention
+            end
+        end
+        
+        if attention_weight_sum > 1e-10
+            for i in 256
+                v.hidden(i) = attention_sum(i) / attention_weight_sum
+            end
+        end
+    end
+end
+
+proc compute_attention_weights(neural_vertices, neural_edges)
+    for (src, dst) in neural_edges
+        var e : NeuralEdge = neural_edges(src, dst)
+        var src_vertex : NeuralVertex = src
+        var dst_vertex : NeuralVertex = dst
+        
+        var dot_product : float = 0.0
+        for i in 256
+            dot_product += src_vertex.hidden(i) * dst_vertex.hidden(i)
+        end
+        
+        e.attention = exp(dot_product / sqrt(256.0))
+    end
+    
+    for v in neural_vertices
+        var sum_exp : float = 0.0
+        
+        for (src, dst) in neural_edges
+            if dst == v
+                var e : NeuralEdge = neural_edges(src, dst)
+                sum_exp += e.attention
+            end
+        end
+        
+        for (src, dst) in neural_edges
+            if dst == v
+                var e : NeuralEdge = neural_edges(src, dst)
+                e.attention = e.attention / (sum_exp + 1e-10)
+            end
+        end
+    end
+end
+
+proc message_passing_layer(neural_vertices, neural_edges)
+    for v in neural_vertices
+        var message_sum : tensor[256](float)
+        var neighbor_count : int = 0
+        
+        for (src, dst) in neural_edges
+            if dst == v
+                var src_vertex : NeuralVertex = src
+                var e : NeuralEdge = neural_edges(src, dst)
+                
+                for i in 256
+                    message_sum(i) += src_vertex.hidden(i) * e.weight
+                end
+                neighbor_count += 1
+            end
+        end
+        
+        if neighbor_count > 0
+            for i in 256
+                v.hidden(i) = relu(message_sum(i) / float(neighbor_count) + v.hidden(i))
+            end
+        end
+    end
+end
+
+proc graph_convolution(neural_vertices, neural_edges, weight_matrix : tensor[256, 256](float))
+    for v in neural_vertices
+        var aggregated : tensor[256](float)
+        var degree : float = 0.0
+        
+        for (src, dst) in neural_edges
+            if dst == v
+                var src_vertex : NeuralVertex = src
+                for i in 256
+                    aggregated(i) += src_vertex.hidden(i)
+                end
+                degree += 1.0
+            end
+        end
+        
+        if degree > 0.0
+            var inv_sqrt_degree : float = 1.0 / sqrt(degree)
+            for i in 256
+                aggregated(i) = aggregated(i) * inv_sqrt_degree
+            end
+        end
+        
+        var transformed : tensor[256](float)
+        for i in 256
+            for j in 256
+                transformed(i) += weight_matrix(i, j) * aggregated(j)
+            end
+        end
+        
+        for i in 256
+            v.hidden(i) = relu(transformed(i))
+        end
+    end
+end
+
+proc readout_layer(neural_vertices)
+    for v in neural_vertices
+        for i in 10
+            var sum : float = 0.0
+            for j in 256
+                sum += v.hidden(j)
+            end
+            v.output(i) = sum / 256.0
+        end
+    end
+end
+
+func softmax_sum(neural_vertices) -> float
+    var max_val : float = -1e38
+    for v in neural_vertices
+        for i in 10
+            if v.output(i) > max_val
+                max_val = v.output(i)
+            end
+        end
+    end
+    
+    var sum_exp : float = 0.0
+    for v in neural_vertices
+        for i in 10
+            sum_exp += exp(v.output(i) - max_val)
+        end
+    end
+    
+    return sum_exp
+end
+
+proc apply_softmax(neural_vertices, sum_exp : float, max_val : float)
+    for v in neural_vertices
+        for i in 10
+            v.output(i) = exp(v.output(i) - max_val) / sum_exp
+        end
+    end
+end
+
+proc backward_linear(neural_vertices, grad_output : tensor[10](float), weight : tensor[768, 10](float))
+    for v in neural_vertices
+        for i in 768
+            var grad_sum : float = 0.0
+            for j in 10
+                grad_sum += grad_output(j) * weight(i, j)
+            end
+            v.gradient(i) = grad_sum
+        end
+    end
+end
+
+proc aggregate_gradients(neural_vertices, neural_edges)
+    for (src, dst) in neural_edges
+        var e : NeuralEdge = neural_edges(src, dst)
+        var dst_vertex : NeuralVertex = dst
+        
+        var grad_weight : float = 0.0
+        for i in 256
+            grad_weight += dst_vertex.gradient(i) * dst_vertex.hidden(i)
+        end
+        
+        e.weight -= 0.001 * grad_weight
+    end
+end
+
+element SparseMatrixEntry
+    row : int
+    col : int
+    value : float
+end
+
+extern sparse_entries : set{SparseMatrixEntry}
+
+proc sparse_matrix_vector_multiply(sparse_entries, x : tensor[1000](float), y : tensor[1000](float))
+    for entry in sparse_entries
+        y(entry.row) += entry.value * x(entry.col)
+    end
+end
+
+proc sparse_matrix_transpose_multiply(sparse_entries, x : tensor[1000](float), y : tensor[1000](float))
+    for entry in sparse_entries
+        y(entry.col) += entry.value * x(entry.row)
+    end
+end
+
+element MeshVertex
+    position : tensor[3](float)
+    normal : tensor[3](float)
+    uv : tensor[2](float)
+    color : tensor[4](float)
+    bone_weights : tensor[4](float)
+    bone_indices : tensor[4](int)
+end
+
+element MeshFace
+    material_id : int
+end
+
+extern mesh_vertices : set{MeshVertex}
+extern mesh_faces : set{MeshFace}(mesh_vertices, mesh_vertices, mesh_vertices)
+
+proc compute_vertex_normals(mesh_vertices, mesh_faces)
+    for v in mesh_vertices
+        v.normal(0) = 0.0
+        v.normal(1) = 0.0
+        v.normal(2) = 0.0
+    end
+    
+    for (v0, v1, v2) in mesh_faces
+        var e1 : tensor[3](float) = v1.position - v0.position
+        var e2 : tensor[3](float) = v2.position - v0.position
+        var face_normal : tensor[3](float) = cross(e1, e2)
+        
+        v0.normal += face_normal
+        v1.normal += face_normal
+        v2.normal += face_normal
+    end
+    
+    for v in mesh_vertices
+        v.normal = normalize(v.normal)
+    end
+end
+
+proc smooth_mesh(mesh_vertices, mesh_faces, lambda : float)
+    for v in mesh_vertices
+        var avg_position : tensor[3](float)
+        var neighbor_count : int = 0
+        
+        for (v0, v1, v2) in mesh_faces
+            if v0 == v or v1 == v or v2 == v
+                if v0 != v
+                    avg_position += v0.position
+                    neighbor_count += 1
+                end
+                if v1 != v
+                    avg_position += v1.position
+                    neighbor_count += 1
+                end
+                if v2 != v
+                    avg_position += v2.position
+                    neighbor_count += 1
+                end
+            end
+        end
+        
+        if neighbor_count > 0
+            avg_position = avg_position / float(neighbor_count)
+            v.position = v.position * (1.0 - lambda) + avg_position * lambda
+        end
+    end
+end
+
+element Particle
+    position : tensor[3](float)
+    velocity : tensor[3](float)
+    force : tensor[3](float)
+    density : float
+    pressure : float
+    mass : float
+end
+
+extern particles : set{Particle}
+extern particle_neighbors : set{Edge}(particles, particles)
+
+func kernel_poly6(r : float, h : float) -> float
+    if r >= h
+        return 0.0
+    end
+    var h2 : float = h * h
+    var r2 : float = r * r
+    var diff : float = h2 - r2
+    var coeff : float = 315.0 / (64.0 * 3.14159265359 * pow(h, 9))
+    return coeff * pow(diff, 3)
+end
+
+func kernel_spiky_gradient(r : float, h : float) -> float
+    if r >= h or r < 1e-10
+        return 0.0
+    end
+    var coeff : float = -45.0 / (3.14159265359 * pow(h, 6))
+    var diff : float = h - r
+    return coeff * pow(diff, 2) / r
+end
+
+proc compute_density(particles, particle_neighbors, h : float)
+    for p in particles
+        var density_sum : float = 0.0
+        
+        for (p1, p2) in particle_neighbors
+            if p1 == p
+                var r : tensor[3](float) = p2.position - p1.position
+                var r_len : float = norm(r)
+                density_sum += p2.mass * kernel_poly6(r_len, h)
+            end
+        end
+        
+        p.density = density_sum + p.mass * kernel_poly6(0.0, h)
+    end
+end
+
+proc compute_pressure(particles, k : float, rho0 : float)
+    for p in particles
+        p.pressure = k * (p.density - rho0)
+    end
+end
+
+proc compute_pressure_force(particles, particle_neighbors, h : float)
+    for p in particles
+        p.force(0) = 0.0
+        p.force(1) = 0.0
+        p.force(2) = 0.0
+    end
+    
+    for (p1, p2) in particle_neighbors
+        var r : tensor[3](float) = p2.position - p1.position
+        var r_len : float = norm(r)
+        
+        if r_len > 1e-10 and r_len < h
+            var pressure_term : float = (p1.pressure + p2.pressure) / (2.0 * p2.density)
+            var grad_w : float = kernel_spiky_gradient(r_len, h)
+            var direction : tensor[3](float) = r / r_len
+            
+            var force_magnitude : float = -p2.mass * pressure_term * grad_w
+            p1.force += direction * force_magnitude
+        end
+    end
+end
+
+proc sph_step(particles, particle_neighbors, dt : float, h : float, k : float, rho0 : float)
+    compute_density(particles, particle_neighbors, h)
+    compute_pressure(particles, k, rho0)
+    compute_pressure_force(particles, particle_neighbors, h)
+    
+    for p in particles
+        p.velocity += (p.force / p.density) * dt
+        p.position += p.velocity * dt
+    end
+end

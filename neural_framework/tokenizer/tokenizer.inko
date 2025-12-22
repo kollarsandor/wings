@@ -1,0 +1,1296 @@
+import std.channel (Channel, Sender, Receiver)
+import std.process (Process)
+import std.string (String, StringBuffer)
+import std.array (Array)
+import std.hash (Hash, Hasher)
+import std.map (Map)
+import std.set (Set)
+import std.option (Option, Some, None)
+import std.result (Result, Ok, Err)
+import std.iter (Iterator)
+import std.io (Write, Read)
+import std.fs (File, Path)
+import std.time (Duration, Instant)
+import std.sync (Mutex, RwLock)
+import std.cmp (Ordering, Compare)
+import std.fmt (Format, Formatter)
+
+class TokenType {
+    let @value: Int
+
+    fn static word -> TokenType {
+        TokenType { @value = 0 }
+    }
+
+    fn static punctuation -> TokenType {
+        TokenType { @value = 1 }
+    }
+
+    fn static number -> TokenType {
+        TokenType { @value = 2 }
+    }
+
+    fn static whitespace -> TokenType {
+        TokenType { @value = 3 }
+    }
+
+    fn static special -> TokenType {
+        TokenType { @value = 4 }
+    }
+
+    fn static subword -> TokenType {
+        TokenType { @value = 5 }
+    }
+
+    fn static unknown -> TokenType {
+        TokenType { @value = 6 }
+    }
+
+    fn static bos -> TokenType {
+        TokenType { @value = 7 }
+    }
+
+    fn static eos -> TokenType {
+        TokenType { @value = 8 }
+    }
+
+    fn static pad -> TokenType {
+        TokenType { @value = 9 }
+    }
+
+    fn static mask -> TokenType {
+        TokenType { @value = 10 }
+    }
+}
+
+class Token {
+    let @id: Int
+    let @text: String
+    let @token_type: TokenType
+    let @start_pos: Int
+    let @end_pos: Int
+    let @attention_mask: Float
+    let @position_id: Int
+    let @segment_id: Int
+
+    fn static new(id: Int, text: String, token_type: TokenType, start: Int, end: Int) -> Token {
+        Token {
+            @id = id,
+            @text = text,
+            @token_type = token_type,
+            @start_pos = start,
+            @end_pos = end,
+            @attention_mask = 1.0,
+            @position_id = 0,
+            @segment_id = 0
+        }
+    }
+
+    fn with_position(mut self, pos: Int) -> Token {
+        @position_id = pos
+        self
+    }
+
+    fn with_segment(mut self, seg: Int) -> Token {
+        @segment_id = seg
+        self
+    }
+
+    fn with_attention(mut self, att: Float) -> Token {
+        @attention_mask = att
+        self
+    }
+}
+
+class VocabularyEntry {
+    let @token: String
+    let @id: Int
+    let @frequency: Int
+    let @score: Float
+    let @is_special: Bool
+    let @merge_priority: Int
+}
+
+class Vocabulary {
+    let @token_to_id: Map[String, Int]
+    let @id_to_token: Map[Int, String]
+    let @frequencies: Map[Int, Int]
+    let @scores: Map[Int, Float]
+    let @special_tokens: Set[Int]
+    let @size: Int
+    let @unk_id: Int
+    let @bos_id: Int
+    let @eos_id: Int
+    let @pad_id: Int
+    let @mask_id: Int
+
+    fn static new -> Vocabulary {
+        let mut vocab = Vocabulary {
+            @token_to_id = Map.new,
+            @id_to_token = Map.new,
+            @frequencies = Map.new,
+            @scores = Map.new,
+            @special_tokens = Set.new,
+            @size = 0,
+            @unk_id = 0,
+            @bos_id = 1,
+            @eos_id = 2,
+            @pad_id = 3,
+            @mask_id = 4
+        }
+        vocab.add_special_token("[UNK]", 0)
+        vocab.add_special_token("[BOS]", 1)
+        vocab.add_special_token("[EOS]", 2)
+        vocab.add_special_token("[PAD]", 3)
+        vocab.add_special_token("[MASK]", 4)
+        vocab
+    }
+
+    fn mut add_special_token(token: String, id: Int) {
+        @token_to_id.set(token, id)
+        @id_to_token.set(id, token)
+        @special_tokens.insert(id)
+        @frequencies.set(id, 0)
+        @scores.set(id, Float.infinity)
+        if id >= @size {
+            @size = id + 1
+        }
+    }
+
+    fn mut add_token(token: String, frequency: Int, score: Float) -> Int {
+        match @token_to_id.get(token) {
+            case Some(id) -> {
+                @frequencies.set(id, frequency)
+                @scores.set(id, score)
+                id
+            }
+            case None -> {
+                let id = @size
+                @token_to_id.set(token, id)
+                @id_to_token.set(id, token)
+                @frequencies.set(id, frequency)
+                @scores.set(id, score)
+                @size = @size + 1
+                id
+            }
+        }
+    }
+
+    fn get_id(token: ref String) -> Option[Int] {
+        @token_to_id.get(token)
+    }
+
+    fn get_token(id: Int) -> Option[String] {
+        @id_to_token.get(id)
+    }
+
+    fn is_special(id: Int) -> Bool {
+        @special_tokens.contains(id)
+    }
+
+    fn get_score(id: Int) -> Float {
+        match @scores.get(id) {
+            case Some(s) -> s
+            case None -> 0.0
+        }
+    }
+}
+
+class BytePairEncoder {
+    let @merges: Map[String, String]
+    let @merge_ranks: Map[String, Int]
+    let @cache: Map[String, Array[String]]
+    let @max_cache_size: Int
+
+    fn static new -> BytePairEncoder {
+        BytePairEncoder {
+            @merges = Map.new,
+            @merge_ranks = Map.new,
+            @cache = Map.new,
+            @max_cache_size = 100000
+        }
+    }
+
+    fn mut add_merge(pair: String, result: String, rank: Int) {
+        @merges.set(pair, result)
+        @merge_ranks.set(pair, rank)
+    }
+
+    fn get_pairs(word: ref Array[String]) -> Array[String] {
+        let mut pairs = Array.new
+        let len = word.size
+        if len < 2 {
+            return pairs
+        }
+        let mut i = 0
+        loop {
+            if i >= len - 1 {
+                break
+            }
+            let pair = word.get(i).unwrap + " " + word.get(i + 1).unwrap
+            pairs.push(pair)
+            i = i + 1
+        }
+        pairs
+    }
+
+    fn mut encode(word: String) -> Array[String] {
+        match @cache.get(word) {
+            case Some(cached) -> return cached.clone
+            case None -> {}
+        }
+
+        let mut chars = Array.new
+        let mut iter = word.chars
+        loop {
+            match iter.next {
+                case Some(c) -> chars.push(c.to_string)
+                case None -> break
+            }
+        }
+
+        if chars.size == 0 {
+            return Array.new
+        }
+
+        if chars.size == 1 {
+            return chars
+        }
+
+        loop {
+            let pairs = get_pairs(chars)
+            if pairs.size == 0 {
+                break
+            }
+
+            let mut best_pair: Option[String] = None
+            let mut best_rank = Int.max_value
+
+            let mut idx = 0
+            loop {
+                if idx >= pairs.size {
+                    break
+                }
+                let pair = pairs.get(idx).unwrap
+                match @merge_ranks.get(pair) {
+                    case Some(rank) -> {
+                        if rank < best_rank {
+                            best_rank = rank
+                            best_pair = Some(pair)
+                        }
+                    }
+                    case None -> {}
+                }
+                idx = idx + 1
+            }
+
+            match best_pair {
+                case None -> break
+                case Some(pair) -> {
+                    let merged = @merges.get(pair).unwrap
+                    let parts = pair.split(" ")
+                    let first = parts.get(0).unwrap
+                    let second = parts.get(1).unwrap
+                    
+                    let mut new_chars = Array.new
+                    let mut i = 0
+                    loop {
+                        if i >= chars.size {
+                            break
+                        }
+                        if i < chars.size - 1 {
+                            let current = chars.get(i).unwrap
+                            let next = chars.get(i + 1).unwrap
+                            if current == first and next == second {
+                                new_chars.push(merged)
+                                i = i + 2
+                            } else {
+                                new_chars.push(current)
+                                i = i + 1
+                            }
+                        } else {
+                            new_chars.push(chars.get(i).unwrap)
+                            i = i + 1
+                        }
+                    }
+                    chars = new_chars
+                }
+            }
+        }
+
+        if @cache.size < @max_cache_size {
+            @cache.set(word, chars.clone)
+        }
+
+        chars
+    }
+}
+
+class WordPieceEncoder {
+    let @vocab: ref Vocabulary
+    let @max_word_length: Int
+    let @unknown_token: String
+    let @continuing_prefix: String
+
+    fn static new(vocab: ref Vocabulary) -> WordPieceEncoder {
+        WordPieceEncoder {
+            @vocab = vocab,
+            @max_word_length = 200,
+            @unknown_token = "[UNK]",
+            @continuing_prefix = "##"
+        }
+    }
+
+    fn encode(word: String) -> Array[Int] {
+        let mut tokens = Array.new
+        
+        if word.size > @max_word_length {
+            tokens.push(@vocab.unk_id)
+            return tokens
+        }
+
+        let mut start = 0
+        let len = word.size
+
+        loop {
+            if start >= len {
+                break
+            }
+
+            let mut end = len
+            let mut found = false
+
+            loop {
+                if end <= start {
+                    break
+                }
+
+                let mut substr = ""
+                if start > 0 {
+                    substr = @continuing_prefix + word.substring(start, end)
+                } else {
+                    substr = word.substring(start, end)
+                }
+
+                match @vocab.get_id(substr) {
+                    case Some(id) -> {
+                        tokens.push(id)
+                        start = end
+                        found = true
+                        break
+                    }
+                    case None -> {
+                        end = end - 1
+                    }
+                }
+            }
+
+            if found == false {
+                tokens.push(@vocab.unk_id)
+                start = start + 1
+            }
+        }
+
+        tokens
+    }
+}
+
+class UnigramEncoder {
+    let @vocab: ref Vocabulary
+    let @scores: Array[Float]
+    let @min_score: Float
+
+    fn static new(vocab: ref Vocabulary) -> UnigramEncoder {
+        let mut scores = Array.new
+        let mut i = 0
+        loop {
+            if i >= vocab.size {
+                break
+            }
+            scores.push(vocab.get_score(i))
+            i = i + 1
+        }
+        UnigramEncoder {
+            @vocab = vocab,
+            @scores = scores,
+            @min_score = -Float.infinity
+        }
+    }
+
+    fn viterbi_decode(text: String) -> Array[Int] {
+        let len = text.size
+        if len == 0 {
+            return Array.new
+        }
+
+        let mut best_score = Array.with_capacity(len + 1)
+        let mut best_edge = Array.with_capacity(len + 1)
+        
+        let mut i = 0
+        loop {
+            if i > len {
+                break
+            }
+            best_score.push(@min_score)
+            best_edge.push(-1)
+            i = i + 1
+        }
+        best_score.set(0, 0.0)
+
+        let mut end_pos = 1
+        loop {
+            if end_pos > len {
+                break
+            }
+
+            let mut start_pos = 0
+            loop {
+                if start_pos >= end_pos {
+                    break
+                }
+
+                let substr = text.substring(start_pos, end_pos)
+                match @vocab.get_id(substr) {
+                    case Some(id) -> {
+                        let score = best_score.get(start_pos).unwrap + @scores.get(id).unwrap
+                        if score > best_score.get(end_pos).unwrap {
+                            best_score.set(end_pos, score)
+                            best_edge.set(end_pos, start_pos)
+                        }
+                    }
+                    case None -> {}
+                }
+
+                start_pos = start_pos + 1
+            }
+
+            end_pos = end_pos + 1
+        }
+
+        let mut tokens = Array.new
+        let mut pos = len
+
+        loop {
+            if pos == 0 {
+                break
+            }
+
+            let start = best_edge.get(pos).unwrap
+            if start < 0 {
+                tokens.push(@vocab.unk_id)
+                pos = pos - 1
+            } else {
+                let substr = text.substring(start, pos)
+                match @vocab.get_id(substr) {
+                    case Some(id) -> tokens.push(id)
+                    case None -> tokens.push(@vocab.unk_id)
+                }
+                pos = start
+            }
+        }
+
+        tokens.reverse
+        tokens
+    }
+}
+
+class TokenizerMessage {
+    let @message_type: Int
+    let @text: String
+    let @start_offset: Int
+    let @end_offset: Int
+    let @batch_id: Int
+    let @sequence_id: Int
+}
+
+class TokenizerResult {
+    let @tokens: Array[Token]
+    let @batch_id: Int
+    let @sequence_id: Int
+    let @processing_time_ns: Int
+    let @success: Bool
+    let @error_message: String
+}
+
+class TokenizerWorker {
+    let @worker_id: Int
+    let @vocab: Vocabulary
+    let @bpe: BytePairEncoder
+    let @input: Receiver[TokenizerMessage]
+    let @output: Sender[TokenizerResult]
+    let @tokens_processed: Int
+    let @errors_count: Int
+
+    fn static spawn(
+        worker_id: Int,
+        vocab: Vocabulary,
+        bpe: BytePairEncoder,
+        input: Receiver[TokenizerMessage],
+        output: Sender[TokenizerResult]
+    ) -> Process {
+        Process.spawn {
+            let mut worker = TokenizerWorker {
+                @worker_id = worker_id,
+                @vocab = vocab,
+                @bpe = bpe,
+                @input = input,
+                @output = output,
+                @tokens_processed = 0,
+                @errors_count = 0
+            }
+            worker.run
+        }
+    }
+
+    fn mut run {
+        loop {
+            match @input.receive {
+                case Some(message) -> {
+                    if message.message_type == -1 {
+                        break
+                    }
+                    let result = process_message(message)
+                    @output.send(result)
+                }
+                case None -> break
+            }
+        }
+    }
+
+    fn mut process_message(message: TokenizerMessage) -> TokenizerResult {
+        let start_time = Instant.now
+
+        let text = message.text
+        let mut tokens = Array.new
+
+        if text.size == 0 {
+            return TokenizerResult {
+                @tokens = tokens,
+                @batch_id = message.batch_id,
+                @sequence_id = message.sequence_id,
+                @processing_time_ns = 0,
+                @success = true,
+                @error_message = ""
+            }
+        }
+
+        tokens.push(Token.new(@vocab.bos_id, "[BOS]", TokenType.bos, 0, 0))
+
+        let words = split_into_words(text)
+        let mut position = 1
+        let mut char_offset = message.start_offset
+
+        let mut word_idx = 0
+        loop {
+            if word_idx >= words.size {
+                break
+            }
+
+            let word = words.get(word_idx).unwrap
+            let word_len = word.size
+
+            let subwords = @bpe.encode(word)
+            
+            let mut sub_idx = 0
+            loop {
+                if sub_idx >= subwords.size {
+                    break
+                }
+
+                let subword = subwords.get(sub_idx).unwrap
+                let subword_len = subword.size
+
+                match @vocab.get_id(subword) {
+                    case Some(id) -> {
+                        let token = Token.new(
+                            id,
+                            subword,
+                            TokenType.subword,
+                            char_offset,
+                            char_offset + subword_len
+                        ).with_position(position)
+                        tokens.push(token)
+                        @tokens_processed = @tokens_processed + 1
+                    }
+                    case None -> {
+                        let token = Token.new(
+                            @vocab.unk_id,
+                            subword,
+                            TokenType.unknown,
+                            char_offset,
+                            char_offset + subword_len
+                        ).with_position(position)
+                        tokens.push(token)
+                    }
+                }
+
+                char_offset = char_offset + subword_len
+                position = position + 1
+                sub_idx = sub_idx + 1
+            }
+
+            word_idx = word_idx + 1
+        }
+
+        tokens.push(Token.new(
+            @vocab.eos_id,
+            "[EOS]",
+            TokenType.eos,
+            char_offset,
+            char_offset
+        ).with_position(position))
+
+        let elapsed = start_time.elapsed
+
+        TokenizerResult {
+            @tokens = tokens,
+            @batch_id = message.batch_id,
+            @sequence_id = message.sequence_id,
+            @processing_time_ns = elapsed.as_nanos.to_int,
+            @success = true,
+            @error_message = ""
+        }
+    }
+
+    fn split_into_words(text: String) -> Array[String] {
+        let mut words = Array.new
+        let mut current_word = StringBuffer.new
+        let mut in_word = false
+
+        let mut chars = text.chars
+        loop {
+            match chars.next {
+                case Some(c) -> {
+                    if is_whitespace(c) {
+                        if in_word {
+                            words.push(current_word.to_string)
+                            current_word = StringBuffer.new
+                            in_word = false
+                        }
+                    } else if is_punctuation(c) {
+                        if in_word {
+                            words.push(current_word.to_string)
+                            current_word = StringBuffer.new
+                            in_word = false
+                        }
+                        words.push(c.to_string)
+                    } else {
+                        current_word.push(c)
+                        in_word = true
+                    }
+                }
+                case None -> break
+            }
+        }
+
+        if in_word {
+            words.push(current_word.to_string)
+        }
+
+        words
+    }
+
+    fn is_whitespace(c: Char) -> Bool {
+        c == ' ' or c == '\t' or c == '\n' or c == '\r'
+    }
+
+    fn is_punctuation(c: Char) -> Bool {
+        let code = c.to_int
+        (code >= 33 and code <= 47) or
+        (code >= 58 and code <= 64) or
+        (code >= 91 and code <= 96) or
+        (code >= 123 and code <= 126)
+    }
+}
+
+class ParallelTokenizer {
+    let @vocab: Vocabulary
+    let @bpe: BytePairEncoder
+    let @num_workers: Int
+    let @input_channels: Array[Sender[TokenizerMessage]]
+    let @output_channel: Receiver[TokenizerResult]
+    let @output_sender: Sender[TokenizerResult]
+    let @workers: Array[Process]
+    let @batch_counter: Int
+    let @pending_results: Map[Int, Array[TokenizerResult]]
+    let @max_sequence_length: Int
+    let @pad_to_max_length: Bool
+
+    fn static new(vocab: Vocabulary, num_workers: Int) -> ParallelTokenizer {
+        let (output_sender, output_receiver) = Channel.new
+
+        let mut input_channels = Array.new
+        let mut workers = Array.new
+        let bpe = BytePairEncoder.new
+
+        let mut i = 0
+        loop {
+            if i >= num_workers {
+                break
+            }
+
+            let (input_sender, input_receiver) = Channel.new
+            input_channels.push(input_sender)
+
+            let worker = TokenizerWorker.spawn(
+                i,
+                vocab.clone,
+                bpe.clone,
+                input_receiver,
+                output_sender.clone
+            )
+            workers.push(worker)
+
+            i = i + 1
+        }
+
+        ParallelTokenizer {
+            @vocab = vocab,
+            @bpe = bpe,
+            @num_workers = num_workers,
+            @input_channels = input_channels,
+            @output_channel = output_receiver,
+            @output_sender = output_sender,
+            @workers = workers,
+            @batch_counter = 0,
+            @pending_results = Map.new,
+            @max_sequence_length = 512,
+            @pad_to_max_length = true
+        }
+    }
+
+    fn mut tokenize_batch(texts: Array[String]) -> Array[Array[Token]] {
+        let batch_id = @batch_counter
+        @batch_counter = @batch_counter + 1
+
+        let num_texts = texts.size
+        if num_texts == 0 {
+            return Array.new
+        }
+
+        let mut idx = 0
+        loop {
+            if idx >= num_texts {
+                break
+            }
+
+            let text = texts.get(idx).unwrap
+            let worker_idx = idx % @num_workers
+            let message = TokenizerMessage {
+                @message_type = 0,
+                @text = text,
+                @start_offset = 0,
+                @end_offset = text.size,
+                @batch_id = batch_id,
+                @sequence_id = idx
+            }
+
+            @input_channels.get(worker_idx).unwrap.send(message)
+            idx = idx + 1
+        }
+
+        let mut results = Array.with_capacity(num_texts)
+        let mut i = 0
+        loop {
+            if i >= num_texts {
+                break
+            }
+            results.push(Array.new)
+            i = i + 1
+        }
+
+        let mut received = 0
+        loop {
+            if received >= num_texts {
+                break
+            }
+
+            match @output_channel.receive {
+                case Some(result) -> {
+                    if result.batch_id == batch_id {
+                        results.set(result.sequence_id, result.tokens)
+                        received = received + 1
+                    }
+                }
+                case None -> break
+            }
+        }
+
+        if @pad_to_max_length {
+            results = pad_sequences(results)
+        }
+
+        results
+    }
+
+    fn mut tokenize_single(text: String) -> Array[Token] {
+        let batch = Array.with_element(text)
+        let results = tokenize_batch(batch)
+        match results.get(0) {
+            case Some(tokens) -> tokens
+            case None -> Array.new
+        }
+    }
+
+    fn pad_sequences(sequences: Array[Array[Token]]) -> Array[Array[Token]] {
+        let mut max_len = 0
+        let mut idx = 0
+        loop {
+            if idx >= sequences.size {
+                break
+            }
+            let seq = sequences.get(idx).unwrap
+            if seq.size > max_len {
+                max_len = seq.size
+            }
+            idx = idx + 1
+        }
+
+        if max_len > @max_sequence_length {
+            max_len = @max_sequence_length
+        }
+
+        let mut padded = Array.new
+        idx = 0
+        loop {
+            if idx >= sequences.size {
+                break
+            }
+
+            let seq = sequences.get(idx).unwrap
+            let mut new_seq = Array.new
+
+            let mut token_idx = 0
+            loop {
+                if token_idx >= max_len {
+                    break
+                }
+
+                if token_idx < seq.size {
+                    new_seq.push(seq.get(token_idx).unwrap)
+                } else {
+                    let pad_token = Token.new(
+                        @vocab.pad_id,
+                        "[PAD]",
+                        TokenType.pad,
+                        0,
+                        0
+                    ).with_position(token_idx).with_attention(0.0)
+                    new_seq.push(pad_token)
+                }
+
+                token_idx = token_idx + 1
+            }
+
+            padded.push(new_seq)
+            idx = idx + 1
+        }
+
+        padded
+    }
+
+    fn decode(token_ids: Array[Int]) -> String {
+        let mut result = StringBuffer.new
+        let mut idx = 0
+
+        loop {
+            if idx >= token_ids.size {
+                break
+            }
+
+            let id = token_ids.get(idx).unwrap
+            if @vocab.is_special(id) == false {
+                match @vocab.get_token(id) {
+                    case Some(token) -> {
+                        let cleaned = token.replace("##", "")
+                        result.push_string(cleaned)
+                    }
+                    case None -> {}
+                }
+            }
+
+            idx = idx + 1
+        }
+
+        result.to_string
+    }
+
+    fn mut shutdown {
+        let mut i = 0
+        loop {
+            if i >= @num_workers {
+                break
+            }
+
+            let message = TokenizerMessage {
+                @message_type = -1,
+                @text = "",
+                @start_offset = 0,
+                @end_offset = 0,
+                @batch_id = -1,
+                @sequence_id = -1
+            }
+            @input_channels.get(i).unwrap.send(message)
+            i = i + 1
+        }
+    }
+}
+
+class PreTokenizer {
+    let @split_on_whitespace: Bool
+    let @split_on_punctuation: Bool
+    let @lowercase: Bool
+    let @strip_accents: Bool
+    let @handle_chinese_chars: Bool
+    let @nfd_normalize: Bool
+
+    fn static default -> PreTokenizer {
+        PreTokenizer {
+            @split_on_whitespace = true,
+            @split_on_punctuation = true,
+            @lowercase = true,
+            @strip_accents = true,
+            @handle_chinese_chars = true,
+            @nfd_normalize = true
+        }
+    }
+
+    fn process(text: String) -> Array[String] {
+        let mut current = text
+
+        if @lowercase {
+            current = current.to_lowercase
+        }
+
+        if @strip_accents {
+            current = remove_accents(current)
+        }
+
+        if @handle_chinese_chars {
+            current = add_chinese_whitespace(current)
+        }
+
+        let mut tokens = Array.new
+        let mut current_token = StringBuffer.new
+
+        let mut chars = current.chars
+        loop {
+            match chars.next {
+                case Some(c) -> {
+                    if @split_on_whitespace and is_whitespace(c) {
+                        if current_token.size > 0 {
+                            tokens.push(current_token.to_string)
+                            current_token = StringBuffer.new
+                        }
+                    } else if @split_on_punctuation and is_punctuation_char(c) {
+                        if current_token.size > 0 {
+                            tokens.push(current_token.to_string)
+                            current_token = StringBuffer.new
+                        }
+                        tokens.push(c.to_string)
+                    } else {
+                        current_token.push(c)
+                    }
+                }
+                case None -> break
+            }
+        }
+
+        if current_token.size > 0 {
+            tokens.push(current_token.to_string)
+        }
+
+        tokens
+    }
+
+    fn is_whitespace(c: Char) -> Bool {
+        c == ' ' or c == '\t' or c == '\n' or c == '\r'
+    }
+
+    fn is_punctuation_char(c: Char) -> Bool {
+        let code = c.to_int
+        (code >= 33 and code <= 47) or
+        (code >= 58 and code <= 64) or
+        (code >= 91 and code <= 96) or
+        (code >= 123 and code <= 126)
+    }
+
+    fn remove_accents(text: String) -> String {
+        text
+    }
+
+    fn add_chinese_whitespace(text: String) -> String {
+        let mut result = StringBuffer.new
+        let mut chars = text.chars
+        loop {
+            match chars.next {
+                case Some(c) -> {
+                    if is_chinese_char(c) {
+                        result.push(' ')
+                        result.push(c)
+                        result.push(' ')
+                    } else {
+                        result.push(c)
+                    }
+                }
+                case None -> break
+            }
+        }
+        result.to_string
+    }
+
+    fn is_chinese_char(c: Char) -> Bool {
+        let cp = c.to_int
+        (cp >= 0x4E00 and cp <= 0x9FFF) or
+        (cp >= 0x3400 and cp <= 0x4DBF) or
+        (cp >= 0x20000 and cp <= 0x2A6DF) or
+        (cp >= 0x2A700 and cp <= 0x2B73F) or
+        (cp >= 0x2B740 and cp <= 0x2B81F) or
+        (cp >= 0x2B820 and cp <= 0x2CEAF) or
+        (cp >= 0xF900 and cp <= 0xFAFF) or
+        (cp >= 0x2F800 and cp <= 0x2FA1F)
+    }
+}
+
+class PostProcessor {
+    let @add_special_tokens: Bool
+    let @bos_token_id: Int
+    let @eos_token_id: Int
+    let @sep_token_id: Int
+    let @cls_token_id: Int
+
+    fn static default(vocab: ref Vocabulary) -> PostProcessor {
+        PostProcessor {
+            @add_special_tokens = true,
+            @bos_token_id = vocab.bos_id,
+            @eos_token_id = vocab.eos_id,
+            @sep_token_id = vocab.eos_id,
+            @cls_token_id = vocab.bos_id
+        }
+    }
+
+    fn process_single(tokens: Array[Int]) -> Array[Int] {
+        if @add_special_tokens == false {
+            return tokens
+        }
+
+        let mut result = Array.with_capacity(tokens.size + 2)
+        result.push(@cls_token_id)
+
+        let mut i = 0
+        loop {
+            if i >= tokens.size {
+                break
+            }
+            result.push(tokens.get(i).unwrap)
+            i = i + 1
+        }
+
+        result.push(@sep_token_id)
+        result
+    }
+
+    fn process_pair(tokens_a: Array[Int], tokens_b: Array[Int]) -> Array[Int] {
+        if @add_special_tokens == false {
+            let mut result = tokens_a.clone
+            let mut i = 0
+            loop {
+                if i >= tokens_b.size {
+                    break
+                }
+                result.push(tokens_b.get(i).unwrap)
+                i = i + 1
+            }
+            return result
+        }
+
+        let mut result = Array.with_capacity(tokens_a.size + tokens_b.size + 3)
+        result.push(@cls_token_id)
+
+        let mut i = 0
+        loop {
+            if i >= tokens_a.size {
+                break
+            }
+            result.push(tokens_a.get(i).unwrap)
+            i = i + 1
+        }
+
+        result.push(@sep_token_id)
+
+        i = 0
+        loop {
+            if i >= tokens_b.size {
+                break
+            }
+            result.push(tokens_b.get(i).unwrap)
+            i = i + 1
+        }
+
+        result.push(@sep_token_id)
+        result
+    }
+
+    fn get_segment_ids(tokens_a_len: Int, tokens_b_len: Int) -> Array[Int] {
+        let mut segments = Array.new
+        
+        let total_a = tokens_a_len + 2
+        let mut i = 0
+        loop {
+            if i >= total_a {
+                break
+            }
+            segments.push(0)
+            i = i + 1
+        }
+
+        let total_b = tokens_b_len + 1
+        i = 0
+        loop {
+            if i >= total_b {
+                break
+            }
+            segments.push(1)
+            i = i + 1
+        }
+
+        segments
+    }
+}
+
+class TokenizerConfig {
+    let @vocab_size: Int
+    let @max_sequence_length: Int
+    let @pad_token: String
+    let @unk_token: String
+    let @bos_token: String
+    let @eos_token: String
+    let @mask_token: String
+    let @do_lowercase: Bool
+    let @do_strip_accents: Bool
+    let @num_workers: Int
+    let @batch_size: Int
+
+    fn static default -> TokenizerConfig {
+        TokenizerConfig {
+            @vocab_size = 32000,
+            @max_sequence_length = 512,
+            @pad_token = "[PAD]",
+            @unk_token = "[UNK]",
+            @bos_token = "[BOS]",
+            @eos_token = "[EOS]",
+            @mask_token = "[MASK]",
+            @do_lowercase = true,
+            @do_strip_accents = true,
+            @num_workers = 4,
+            @batch_size = 32
+        }
+    }
+}
+
+class Tokenizer {
+    let @config: TokenizerConfig
+    let @vocab: Vocabulary
+    let @pre_tokenizer: PreTokenizer
+    let @post_processor: PostProcessor
+    let @parallel: ParallelTokenizer
+
+    fn static new(config: TokenizerConfig) -> Tokenizer {
+        let vocab = Vocabulary.new
+        let pre_tokenizer = PreTokenizer.default
+        let post_processor = PostProcessor.default(vocab)
+        let parallel = ParallelTokenizer.new(vocab.clone, config.num_workers)
+
+        Tokenizer {
+            @config = config,
+            @vocab = vocab,
+            @pre_tokenizer = pre_tokenizer,
+            @post_processor = post_processor,
+            @parallel = parallel
+        }
+    }
+
+    fn mut encode(text: String) -> Array[Int] {
+        let tokens = @parallel.tokenize_single(text)
+        let mut ids = Array.new
+
+        let mut i = 0
+        loop {
+            if i >= tokens.size {
+                break
+            }
+            ids.push(tokens.get(i).unwrap.id)
+            i = i + 1
+        }
+
+        ids
+    }
+
+    fn mut encode_batch(texts: Array[String]) -> Array[Array[Int]] {
+        let token_arrays = @parallel.tokenize_batch(texts)
+        let mut id_arrays = Array.new
+
+        let mut batch_idx = 0
+        loop {
+            if batch_idx >= token_arrays.size {
+                break
+            }
+
+            let tokens = token_arrays.get(batch_idx).unwrap
+            let mut ids = Array.new
+
+            let mut token_idx = 0
+            loop {
+                if token_idx >= tokens.size {
+                    break
+                }
+                ids.push(tokens.get(token_idx).unwrap.id)
+                token_idx = token_idx + 1
+            }
+
+            id_arrays.push(ids)
+            batch_idx = batch_idx + 1
+        }
+
+        id_arrays
+    }
+
+    fn decode(ids: Array[Int]) -> String {
+        @parallel.decode(ids)
+    }
+
+    fn vocab_size -> Int {
+        @vocab.size
+    }
+
+    fn mut shutdown {
+        @parallel.shutdown
+    }
+}
+
+class pub Main {
+    fn pub static main {
+        let config = TokenizerConfig.default
+        let mut tokenizer = Tokenizer.new(config)
+
+        let texts = [
+            "Hello world, this is a test.",
+            "Natural language processing is fascinating.",
+            "Parallel tokenization improves performance."
+        ]
+
+        let mut array = Array.new
+        let mut i = 0
+        loop {
+            if i >= 3 {
+                break
+            }
+            array.push(texts.get(i).unwrap)
+            i = i + 1
+        }
+
+        let results = tokenizer.encode_batch(array)
+
+        tokenizer.shutdown
+    }
+}
